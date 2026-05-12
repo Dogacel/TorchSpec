@@ -2432,21 +2432,18 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
-        if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(
-                config.target_hidden_size * self.num_aux_hidden_states,
-                config.hidden_size,
-                bias=False,
-            )
-        else:
-            self.fc = torch.nn.Linear(
-                config.hidden_size * self.num_aux_hidden_states, config.hidden_size, bias=False
-            )
+        target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+
+        self.fc = torch.nn.Linear(
+            target_hidden_size * self.num_aux_hidden_states,
+            config.hidden_size,
+            bias=False,
+        )
         use_fc_norm = getattr(config, "fc_norm", None)
         if use_fc_norm:
             self.fc_norm = nn.ModuleList(
                 [
-                    LlamaRMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+                    LlamaRMSNorm(target_hidden_size, eps=config.rms_norm_eps)
                     for _ in range(self.num_aux_hidden_states)
                 ]
             )

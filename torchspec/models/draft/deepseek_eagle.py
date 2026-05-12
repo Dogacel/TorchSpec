@@ -526,7 +526,7 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
         if use_fc_norm:
             self.fc_norm = nn.ModuleList(
                 [
-                    LlamaRMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+                    LlamaRMSNorm(target_hidden_size, eps=config.rms_norm_eps)
                     for _ in range(self.num_aux_hidden_states)
                 ]
             )
