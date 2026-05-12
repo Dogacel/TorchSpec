@@ -268,6 +268,11 @@ class Eagle3Model(nn.Module):
                 lm_head_weight=lm_head_weight,
                 norm_eps=norm_eps,
             )
+
+            # Model takes its own normed hidden states as input for the next step, so apply norm here if needed.
+            if self.draft_model.norm_output:
+                hidden_states = self.draft_model.norm(hidden_states)
+
             if self.attention_backend == "usp":
                 # A shard can have no local loss tokens while its Ulysses peers do.
                 # Keep the zero-loss path connected to this layer's activations so
