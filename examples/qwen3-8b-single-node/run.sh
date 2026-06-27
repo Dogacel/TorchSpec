@@ -56,6 +56,11 @@ echo "Local IP: $LOCAL_IP"
 echo "Extra args: $*"
 echo "=============================================="
 
+if [[ "$TOTAL_GPUS" -lt $((TRAIN_GPUS + INFERENCE_GPUS)) ]]; then
+    echo "Error: Not enough GPUs available. Total GPUs: $TOTAL_GPUS, Required: $((TRAIN_GPUS + INFERENCE_GPUS))"
+    exit 1
+fi
+
 # TODO: unify tp_size config across sglang/vllm backends
 python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
