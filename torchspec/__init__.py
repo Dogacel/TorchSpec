@@ -24,12 +24,17 @@ from torchspec.models import Eagle3Model
 from torchspec.models.dflash import DFlashModel
 from torchspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
 from torchspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
+from torchspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
+from torchspec.models.dspark import DSparkModel
 
 __all__ = [
     "Eagle3Model",
     "DFlashModel",
     "DFlashConfig",
     "DFlashDraftModel",
+    "DSparkModel",
+    "DSparkConfig",
+    "DSparkDraftModel",
     "AutoDraftModelConfig",
     "AutoEagle3DraftModel",
 ]

@@ -154,6 +154,14 @@ class TrainingConfig:
     dflash_num_anchors: int = 512
     dflash_num_target_layers: int = 5
 
+    # DSpark-specific parameters (used by DSpark trainer only)
+    dspark_num_anchors: int = 512
+    dspark_num_target_layers: int = 5
+    dspark_loss_decay_gamma: float = 4.0
+    dspark_ce_loss_alpha: float = 0.1
+    dspark_l1_loss_alpha: float = 0.9
+    dspark_confidence_head_alpha: float = 1.0
+
 
 @dataclass
 class DecodeConfig:

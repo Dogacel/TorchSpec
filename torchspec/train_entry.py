@@ -250,14 +250,19 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
     Called before dataset loading to fail fast on misconfigurations.
     """
     from torchspec.models.draft.dflash import DFlashConfig
+    from torchspec.models.draft.dspark import DSparkConfig
 
     if not isinstance(draft_model_config, DFlashConfig):
         return
 
+    # DSparkConfig subclasses DFlashConfig
+    is_dspark = isinstance(draft_model_config, DSparkConfig)
+    algo = "DSpark" if is_dspark else "DFlash"
+
     engine_type = getattr(args, "inference_engine_type", "hf")
     if engine_type not in ("vllm", "sgl"):
         raise NotImplementedError(
-            f"DFlash supports inference_engine_type in ('vllm', 'sgl'), got '{engine_type}'."
+            f"{algo} supports inference_engine_type in ('vllm', 'sgl'), got '{engine_type}'."
         )
     if getattr(args, "defer_tokenization", False):
         raise NotImplementedError("DFlash does not support defer_tokenization=True.")
@@ -265,7 +270,7 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
     min_loss = getattr(args, "min_loss_tokens", 0)
     if min_loss < 2 * block_size:
         raise ValueError(
-            f"DFlash requires dataset.min_loss_tokens >= 2 * training.dflash_block_size "
+            f"{algo} requires dataset.min_loss_tokens >= 2 * training.dflash_block_size "
             f"({min_loss} < {2 * block_size}). Set dataset.min_loss_tokens={2 * block_size}."
         )
 

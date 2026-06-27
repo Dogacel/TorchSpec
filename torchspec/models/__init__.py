@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 from torchspec.models.dflash import DFlashModel
+from torchspec.models.dspark import DSparkModel
 from torchspec.models.eagle3 import (
     Eagle3Model,
     compute_lazy_target_padded,
@@ -30,6 +31,7 @@ from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 __all__ = [
     "Eagle3Model",
     "DFlashModel",
+    "DSparkModel",
     "compute_lazy_target_padded",
     "compute_target_p_padded",
     "compiled_forward_kl_loss",

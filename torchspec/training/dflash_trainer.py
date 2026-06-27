@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 
 from torchspec.models.dflash import DFlashModel
-from torchspec.models.draft.dflash import DFlashDraftModel
+from torchspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from torchspec.training import checkpoint
 from torchspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
 from torchspec.training.optimizer import BF16Optimizer
@@ -41,7 +41,29 @@ class DFlashTrainer(Trainer):
 
     Extends ``Trainer`` with DFlash model initialisation (dual-source KV draft model),
     forward/backward with anchor sampling + block-causal mask, and metric aggregation.
+
+    DSparkTrainer is a subclass that overrides the build hooks:
+    - `_draft_config_class`
+    - `_build_draft_model`
+    - `_build_training_wrapper`
     """
+
+    _draft_config_class = DFlashConfig
+
+    def _build_draft_model(self, config):
+        """Instantiate the draft network. Overridden by subclasses."""
+        return DFlashDraftModel(config)
+
+    def _build_training_wrapper(self, draft_model):
+        """Wrap the draft network with the training-objective module."""
+        return DFlashModel(
+            draft_model=draft_model,
+            block_size=self.block_size,
+            num_anchors=self.num_anchors,
+            loss_objective=self.loss_objective,
+            dpace_alpha=self.dpace_alpha,
+            loss_decay_gamma=self.loss_decay_gamma,
+        )
 
     def __init__(self, args: Namespace):
         super().__init__(args)
@@ -52,6 +74,10 @@ class DFlashTrainer(Trainer):
         self.loss_objective = getattr(args, "dflash_loss_objective", "decay")
         self.dpace_alpha = getattr(args, "dflash_dpace_alpha", 0.5)
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
+        # Number of leading within-block slots to drop from per-position metrics.
+        # DFlash slot 0 is the masked anchor (drop it); DSpark predicts at every
+        # slot (overrides to 0).
+        self._anchor_slot_offset = 1
 
     def init_model(
         self,
@@ -71,18 +97,18 @@ class DFlashTrainer(Trainer):
         init_context = self._get_init_weight_context_manager()
 
         with init_context():
-            from torchspec.models.draft.dflash import DFlashConfig
+            cfg_cls = self._draft_config_class
 
             if isinstance(draft_model_config, str):
-                config = DFlashConfig.from_pretrained(draft_model_config)
+                config = cfg_cls.from_pretrained(draft_model_config)
             elif isinstance(draft_model_config, dict):
-                config = DFlashConfig(**draft_model_config)
+                config = cfg_cls(**draft_model_config)
             elif isinstance(draft_model_config, DFlashConfig):
                 config = draft_model_config
             else:
                 raise TypeError(
                     f"Unsupported draft_model_config type: {type(draft_model_config).__name__}. "
-                    f"Expected str, dict, or DFlashConfig."
+                    f"Expected str, dict, or {cfg_cls.__name__}."
                 )
 
             if not hasattr(config, "num_target_layers") or config.num_target_layers is None:
@@ -101,7 +127,7 @@ class DFlashTrainer(Trainer):
                 )
                 config.target_num_hidden_layers = target_config.num_hidden_layers
 
-            draft_model = DFlashDraftModel(config)
+            draft_model = self._build_draft_model(config)
 
         if dist.get_rank() == 0:
             draft_model.load_embedding(
@@ -121,14 +147,7 @@ class DFlashTrainer(Trainer):
             f"{frozen_count:,} frozen (embedding) parameters"
         )
 
-        dflash_model = DFlashModel(
-            draft_model=draft_model,
-            block_size=self.block_size,
-            num_anchors=self.num_anchors,
-            loss_objective=self.loss_objective,
-            dpace_alpha=self.dpace_alpha,
-            loss_decay_gamma=self.loss_decay_gamma,
-        )
+        dflash_model = self._build_training_wrapper(draft_model)
 
         full_state = dflash_model.state_dict() if dist.get_rank() == 0 else {}
 
@@ -380,9 +399,9 @@ class DFlashTrainer(Trainer):
         )
 
         # Drop anchor slot (index 0) — see _aggregate_metrics for rationale.
-        pred_loss_pp = avg_loss_pp[1:]
-        pred_acc_pp = avg_acc_pp[1:]
-        pred_count_pp = count_pp[1:]
+        pred_loss_pp = avg_loss_pp[self._anchor_slot_offset :]
+        pred_acc_pp = avg_acc_pp[self._anchor_slot_offset :]
+        pred_count_pp = count_pp[self._anchor_slot_offset :]
 
         cumulative = 1.0
         simulated_acc_len = 0.0
@@ -465,9 +484,9 @@ class DFlashTrainer(Trainer):
         # Skip index 0 (anchor slot, always zero); indices 1..B-1 are the
         # predicted tokens at 1..B-1 steps past the anchor. Re-index to 0..B-2
         # so the naming matches Eagle3 (acc_0 = first predicted token).
-        pred_loss_pp = avg_loss_pp[1:]
-        pred_acc_pp = avg_acc_pp[1:]
-        pred_count_pp = count_pp[1:]
+        pred_loss_pp = avg_loss_pp[self._anchor_slot_offset :]
+        pred_acc_pp = avg_acc_pp[self._anchor_slot_offset :]
+        pred_count_pp = count_pp[self._anchor_slot_offset :]
 
         # Simulated accepted length: acc_0 + acc_0*acc_1 + ... + prod(acc_0..acc_{B-2})
         # Models the expected number of consecutively accepted draft tokens.
