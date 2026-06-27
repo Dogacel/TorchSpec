@@ -94,14 +94,16 @@ class DSparkModel(DFlashModel):
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
         last_hidden_states: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """DSpark training forward.
 
-        Returns the same 5-tuple as :meth:`DFlashModel.forward`
-        (loss, accuracy, loss_per_position, acc_per_position, count_per_position)
-        so the DFlash trainer's metric aggregation is reused unchanged. ``loss``
-        is the combined ce+l1+confidence objective; the per-position metrics are
-        cross-entropy based (acceptance proxy), matching DFlash semantics.
+        Returns DFlashModel.forward's 5-tuple (loss, accuracy, loss_per_position,
+        acc_per_position, count_per_position) plus a 6th element: a dict of
+        detached per-component loss scalars (ce_loss / l1_loss / confidence_loss,
+        per-rank local means) for logging. ``loss`` is the combined
+        ce+l1+confidence objective; the per-position metrics are cross-entropy
+        based (acceptance proxy). DSparkTrainer unpacks the 6th element; the rest
+        of DFlash's aggregation is reused unchanged.
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -265,6 +267,15 @@ class DSparkModel(DFlashModel):
             + self.confidence_head_alpha * conf_num / global_den
         ) * world_size
 
+        # Per-component loss values (per-rank local means) for logging only —
+        # lets you watch L1 fall while the greedy-CE proxy plateaus.
+        local_den_eps = local_den + 1e-6
+        loss_components = {
+            "ce_loss": (ce_num / local_den_eps).detach(),
+            "l1_loss": (l1_num / local_den_eps).detach(),
+            "confidence_loss": (conf_num / local_den_eps).detach(),
+        }
+
         # ---- Metrics (cross-entropy based; all block_size slots are productive) ----
         with torch.no_grad():
             flat_binary = eval_mask.reshape(-1)
@@ -279,4 +290,11 @@ class DSparkModel(DFlashModel):
                 correct.view(bsz, n_blocks, self.block_size).float().sum(dim=(0, 1)) / count_pp
             )
 
-        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
+        return (
+            loss,
+            accuracy,
+            loss_per_position,
+            acc_per_position,
+            count_per_position,
+            loss_components,
+        )

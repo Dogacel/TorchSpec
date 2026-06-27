@@ -49,6 +49,7 @@ class DFlashTrainer(Trainer):
     """
 
     _draft_config_class = DFlashConfig
+    _anchor_slot_offset = 1
 
     def _build_draft_model(self, config):
         """Instantiate the draft network. Overridden by subclasses."""
@@ -74,10 +75,6 @@ class DFlashTrainer(Trainer):
         self.loss_objective = getattr(args, "dflash_loss_objective", "decay")
         self.dpace_alpha = getattr(args, "dflash_dpace_alpha", 0.5)
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
-        # Number of leading within-block slots to drop from per-position metrics.
-        # DFlash slot 0 is the masked anchor (drop it); DSpark predicts at every
-        # slot (overrides to 0).
-        self._anchor_slot_offset = 1
 
     def init_model(
         self,

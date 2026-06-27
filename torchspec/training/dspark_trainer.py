@@ -30,6 +30,7 @@ from argparse import Namespace
 from typing import Tuple
 
 import torch
+import torch.distributed as dist
 
 from torchspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
 from torchspec.models.dspark import DSparkModel
@@ -95,10 +96,55 @@ class DSparkTrainer(DFlashTrainer):
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
 
-        return self.model(
+        # DSparkModel.forward returns a 6th element: a dict of per-component loss
+        # scalars (ce/l1/confidence). Stash it for _train_step to log; return the
+        # 5-tuple the base trainer expects.
+        (
+            loss,
+            accuracy,
+            loss_per_position,
+            acc_per_position,
+            count_per_position,
+            self._last_loss_components,
+        ) = self.model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
             lm_head_weight=self.target_lm_head_weight,
             last_hidden_states=last_hidden_states,
         )
+        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
+
+    # ------------------------------------------------------------------
+    # Per-component loss logging (ce / l1 / confidence)
+    # ------------------------------------------------------------------
+
+    def _train_step(
+        self,
+        batch: dict,
+        accumulation_steps: int,
+        step: int,
+        batch_idx: int,
+        num_batches: int,
+    ) -> dict:
+        metrics = super()._train_step(batch, accumulation_steps, step, batch_idx, num_batches)
+        # Carry the components from the forward that _train_step just ran.
+        for key, value in getattr(self, "_last_loss_components", {}).items():
+            metrics[key] = value
+        return metrics
+
+    def _aggregate_metrics(
+        self, all_step_metrics: list[dict], step: int, *, grad_norm: torch.Tensor = None
+    ) -> dict:
+        metrics = super()._aggregate_metrics(all_step_metrics, step, grad_norm=grad_norm)
+        if all_step_metrics:
+            for key in ("ce_loss", "l1_loss", "confidence_loss"):
+                vals = [m[key] for m in all_step_metrics if key in m]
+                if not vals:
+                    continue
+                value = torch.stack([v.float() for v in vals]).mean()
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    dist.all_reduce(value, op=dist.ReduceOp.SUM)
+                    value = value / dist.get_world_size()
+                metrics[f"train/{key}"] = value.item()
+        return metrics
