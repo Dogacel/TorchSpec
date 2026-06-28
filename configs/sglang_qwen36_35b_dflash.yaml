@@ -1,0 +1,93 @@
+# DFlash training — Qwen3.6-35B-A3B
+#
+# Target: qwen/Qwen3.6-35B-A3B-FP8
+# Draft architecture mirrors z-lab/Qwen3.6-35B-A3B-DFlash (hidden 2048, 6 layers,
+# head_dim 128, 8 target layers) so the result is serveable on the same SGLang
+# DFlash path. Trained from scratch on regenerated Magic-Prompt conversations
+#
+# GPU split (8x B200): 2 inference (SGLang, 35B FP8, tp=1, duplicate) + 6 training
+# (FSDP FULL_SHARD on the tiny draft). global_batch = micro(1) x dp(6) x accum(2) = 12.
+# Watch the progress bar `wait`/`pool`: if training starves (wait>0, pool->0),
+# move a GPU to inference (inference_num_gpus=3, training_num_gpus_per_node=5).
+#
+# Launch:
+#   python -m torchspec.train_entry --config configs/sglang_qwen36_35b_magic_dflash.yaml
+
+model:
+  target_model_path: qwen/Qwen3.6-35B-A3B-FP8
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+  draft_model_config: torchspec/config/dflash_draft_config_qwen36_35b.json
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: null
+  eval_interval: 100
+  chat_template: qwen
+  prompt_key: conversations
+  min_loss_tokens: 32              # DFlash requires >= 2 * dflash_block_size (= 32)
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 2
+  learning_rate: 6e-4
+  min_lr: 6e-5
+  weight_decay: 0.01
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 2048
+  num_epochs: 3
+  seed: 42
+  training_num_gpus_per_node: 6
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 3
+  warmup_ratio: 0.04
+
+  # DFlash-specific
+  dflash_block_size: 16
+  dflash_num_anchors: 512
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 8
+
+inference:
+  inference_engine_type: sgl
+  store_last_hidden_states: false
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.8
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+
+logging:
+  report_to: wandb
+  wandb_project: qwen36-35b-dflash
+
+output_dir: ./outputs/qwen36-35b-dflash
+cache_dir: ./cache/qwen36-35b-dflash
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

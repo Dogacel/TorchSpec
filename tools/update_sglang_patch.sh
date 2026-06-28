@@ -14,10 +14,16 @@ if [ ! -d "$SGLANG_DIR" ]; then
 fi
 
 SGLANG_COMMIT=$(grep "^ARG SGLANG_COMMIT=" "$SGLANG_DIR/Dockerfile" | cut -d= -f2)
+# Newer Dockerfiles (v0.5.14+) pin a prebuilt image via `ARG SGLANG_IMAGE=...`
+# and carry no `ARG SGLANG_COMMIT` line. Fall back to the commit pinned in
+# build_conda.sh (where the assignment may be indented inside a function).
+if [ -z "$SGLANG_COMMIT" ]; then
+    SGLANG_COMMIT=$(grep -E "^[[:space:]]*SGLANG_COMMIT=" "$SCRIPT_DIR/build_conda.sh" | head -1 | cut -d= -f2 | tr -d '"' | tr -d '[:space:]')
+fi
 SGLANG_FOLDER_NAME="${SGLANG_FOLDER_NAME:-$(grep "^SGLANG_FOLDER_NAME=" "$SCRIPT_DIR/build_conda.sh" | cut -d= -f2 | tr -d '"')}"
 
 if [ -z "$SGLANG_COMMIT" ]; then
-    echo "Error: Could not find SGLANG_COMMIT in $SGLANG_DIR/Dockerfile"
+    echo "Error: Could not find SGLANG_COMMIT in $SGLANG_DIR/Dockerfile or build_conda.sh"
     exit 1
 fi
 

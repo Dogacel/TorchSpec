@@ -12,11 +12,12 @@ torchspec sglang patch (base: 4289f36ef9)
  python/sglang/srt/managers/tokenizer_manager.py    |  14 +++
  .../srt/model_executor/forward_batch_info.py       |   7 +-
  python/sglang/srt/model_executor/model_runner.py   |  15 +++
+ python/sglang/srt/models/qwen3_5.py                |   9 +-
  python/sglang/srt/models/qwen3_next.py             |   8 ++
  python/sglang/srt/models/qwen3_next_mtp.py         |   3 +
  python/sglang/srt/server_args.py                   |  23 ++++
  .../sglang/srt/speculative/spec_training_info.py   |  50 ++++++++
- 16 files changed, 520 insertions(+), 18 deletions(-)
+ 17 files changed, 528 insertions(+), 19 deletions(-)
 
 diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
 index d14e3d15cf..a165ad7552 100644
@@ -924,6 +925,26 @@ index 1cff5c9839..80e924bd4f 100644
          # Sample the next tokens
          next_token_ids = self.sampler(
              logits_output,
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 7157eb23e9..d023be9a61 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1253,7 +1253,14 @@ class Qwen3_5ForCausalLM(nn.Module):
+                     forward_batch=forward_batch,
+                     captured_last_layer_outputs=(
+                         aux_hidden_states
+-                        if getattr(layer, "_is_layer_to_capture", False)
++                        # Honor both capture conventions: the per-layer flag set by
++                        # set_dflash_layers_to_capture, and the layers_to_capture list
++                        # set directly by the Qwen3VL wrapper's set_eagle3_layers_to_capture
++                        # (which never marks the per-layer flag on this hybrid model).
++                        if (
++                            getattr(layer, "_is_layer_to_capture", False)
++                            or layer_idx in self.layers_to_capture
++                        )
+                         else None
+                     ),
+                 )
 diff --git a/python/sglang/srt/models/qwen3_next.py b/python/sglang/srt/models/qwen3_next.py
 index f085fb43d4..943af29bbb 100644
 --- a/python/sglang/srt/models/qwen3_next.py
