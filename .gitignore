@@ -89,3 +89,5 @@ wandb/log.txt
 
 .claude/
 wandb/
+data/
+profiles/

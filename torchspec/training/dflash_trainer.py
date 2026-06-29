@@ -50,6 +50,7 @@ class DFlashTrainer(Trainer):
 
     _draft_config_class = DFlashConfig
     _anchor_slot_offset = 1
+    _extra_loss_component_keys: list[str] = []
 
     def _build_draft_model(self, config):
         """Instantiate the draft network. Overridden by subclasses."""
@@ -273,7 +274,7 @@ class DFlashTrainer(Trainer):
 
     def _forward(
         self, batch: dict
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         device = torch.device("cuda")
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         hidden_states = batch["hidden_states"].to(device, non_blocking=True)
@@ -283,17 +284,31 @@ class DFlashTrainer(Trainer):
             loss_mask = loss_mask.squeeze(-1)
         loss_mask = loss_mask.to(device, non_blocking=True)
 
+        last_hidden_states = batch.get("last_hidden_states", None)
+        if last_hidden_states is not None:
+            last_hidden_states = last_hidden_states.to(device, non_blocking=True)
+
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
 
-        loss, accuracy, loss_per_position, acc_per_position, count_per_position = self.model(
-            input_ids=input_ids,
-            hidden_states_list=hidden_states_list,
-            loss_mask=loss_mask,
-            lm_head_weight=self.target_lm_head_weight,
+        loss, accuracy, loss_per_position, acc_per_position, count_per_position, loss_components = (
+            self.model(
+                input_ids=input_ids,
+                hidden_states_list=hidden_states_list,
+                loss_mask=loss_mask,
+                lm_head_weight=self.target_lm_head_weight,
+                last_hidden_states=last_hidden_states,
+            )
         )
 
-        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
+        return (
+            loss,
+            accuracy,
+            loss_per_position,
+            acc_per_position,
+            count_per_position,
+            loss_components,
+        )
 
     def _backward(self, loss: torch.Tensor, accumulation_steps: int = 1) -> torch.Tensor:
         scaled_loss = loss / accumulation_steps
@@ -307,11 +322,14 @@ class DFlashTrainer(Trainer):
     def eval_forward(self, batch: dict) -> dict:
         """Single forward pass without backward — returns per-position tensors."""
         with torch.no_grad():
-            _, _, loss_per_position, acc_per_position, count_per_position = self._forward(batch)
+            _, _, loss_per_position, acc_per_position, count_per_position, loss_components = (
+                self._forward(batch)
+            )
         return {
             "loss_pp": loss_per_position.detach(),
             "acc_pp": acc_per_position.detach(),
             "count_pp": count_per_position.detach(),
+            **loss_components,
         }
 
     def _reduce_position_metrics(
@@ -357,6 +375,22 @@ class DFlashTrainer(Trainer):
         safe_weighted_count = weighted_counts.sum().clamp(min=1.0)
         avg_loss = ((pred_loss_pp * weighted_counts).sum() / safe_weighted_count).item()
         return avg_loss, avg_acc
+
+    def _reduce_loss_components(self, all_step_metrics: list[dict], prefix: str) -> dict:
+        """
+        Reduce extra scalar loss components into ``{prefix}{key}`` global means.
+        """
+        out: dict = {}
+        for key in self._extra_loss_component_keys:
+            vals = [m[key] for m in all_step_metrics if key in m]
+            if not vals:
+                continue
+            value = torch.stack([v.float() for v in vals]).mean()
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                dist.all_reduce(value, op=dist.ReduceOp.SUM)
+                value = value / dist.get_world_size()
+            out[f"{prefix}{key}"] = value.item()
+        return out
 
     def eval_from_cache(self) -> dict:
         """Run forward-only eval over all CPU-cached eval samples.
@@ -419,6 +453,8 @@ class DFlashTrainer(Trainer):
             metrics[f"eval/ploss_{i}"] = pred_loss_pp[i].item()
             metrics[f"eval/acc_{i}"] = pred_acc_pp[i].item()
 
+        metrics.update(self._reduce_loss_components(all_step_metrics, "eval/"))
+
         if dist.get_rank() == 0:
             logger.info(
                 f"eval: loss={weighted_avg_loss:.4f}, acc={avg_acc:.4f}, "
@@ -445,8 +481,8 @@ class DFlashTrainer(Trainer):
         evt_bwd_e = torch.cuda.Event(enable_timing=True)
 
         evt_fwd_s.record()
-        loss, accuracy, loss_per_position, acc_per_position, count_per_position = self._forward(
-            batch
+        loss, accuracy, loss_per_position, acc_per_position, count_per_position, loss_components = (
+            self._forward(batch)
         )
         evt_fwd_e.record()
 
@@ -463,6 +499,7 @@ class DFlashTrainer(Trainer):
             "total_loss": total_loss.detach(),
             "_fwd_events": (evt_fwd_s, evt_fwd_e),
             "_bwd_events": (evt_bwd_s, evt_bwd_e),
+            **loss_components,
         }
 
     def _aggregate_metrics(
@@ -508,6 +545,8 @@ class DFlashTrainer(Trainer):
         for i in range(pred_loss_pp.shape[0]):
             metrics[f"train/ploss_{i}"] = pred_loss_pp[i].item()
             metrics[f"train/acc_{i}"] = pred_acc_pp[i].item()
+
+        metrics.update(self._reduce_loss_components(all_step_metrics, "train/"))
 
         # Sub-timing breakdown (forward vs backward)
         fwd_ms = sum(

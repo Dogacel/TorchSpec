@@ -26,7 +26,7 @@ and cross-entropy loss with exponential decay weighting.
 Matches SpecForge's OnlineDFlashModel (specforge/core/dflash.py).
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -239,26 +239,25 @@ class DFlashModel(nn.Module):
 
         return self.draft_model.embed_tokens(noise_ids)
 
-    def forward(
+    def _draft_backbone(
         self,
         input_ids: torch.Tensor,
         hidden_states_list: List[torch.Tensor],
         loss_mask: torch.Tensor,
-        lm_head_weight: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Full DFlash training forward pass.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """
+        Shared DFlash backbone (context features → anchor sampling → noise
+        embedding → position ids → block-causal mask → draft model forward).
 
-        Matches SpecForge's OnlineDFlashModel.forward().
+        Both ``DFlashModel.forward`` and ``DSparkModel.forward`` build the draft
+        hidden states this exact way; only the label/loss tail differs. Keeping
+        the attention/mask/anchor wiring here gives it a single source of truth.
 
         Returns:
-            loss: scalar training loss (objective-weighted)
-            accuracy: scalar accuracy (binary mask, no decay)
-            loss_per_position: [block_size] mean loss at each within-block position
-                (index 0 is the anchor slot and always 0; indices 1..B-1 are the
-                predicted tokens at 1..B-1 steps past the anchor)
-            acc_per_position: [block_size] mean accuracy at each within-block position
-            count_per_position: [block_size] valid label count at each within-block
-                position before loss decay is applied
+            draft_hidden: [B, n_blocks*block_size, D] pre-loss draft hidden states
+            anchor_positions: [B, n_blocks] sampled anchor positions
+            block_keep_mask: [B, n_blocks] bool validity of each anchor slot
+            n_blocks: number of anchor slots (== num_anchors)
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -309,6 +308,39 @@ class DFlashModel(nn.Module):
             context_position_ids=context_position_ids,
             block_mask=block_mask,
             noise_embedding=noise_embedding,
+        )
+
+        return draft_hidden, anchor_positions, block_keep_mask, n_blocks
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states_list: List[torch.Tensor],
+        loss_mask: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        last_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """
+        Full DFlash training forward pass.
+
+        Returns:
+            loss: scalar training loss (objective-weighted)
+            accuracy: scalar accuracy (binary mask, no decay)
+            loss_per_position: [block_size] mean loss at each within-block position
+                (index 0 is the anchor slot and always 0; indices 1..B-1 are the
+                predicted tokens at 1..B-1 steps past the anchor)
+            acc_per_position: [block_size] mean accuracy at each within-block position
+            count_per_position: [block_size] valid label count at each within-block
+                position before loss decay is applied
+            loss_components: dict of extra per-component loss scalars for logging
+                (empty for the base DFlash objective; populated by subclasses).
+        """
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # 1-6. Shared backbone → draft hidden states + anchor bookkeeping.
+        draft_hidden, anchor_positions, block_keep_mask, n_blocks = self._draft_backbone(
+            input_ids, hidden_states_list, loss_mask
         )
 
         # 7. Compute logits via frozen LM head
@@ -405,4 +437,12 @@ class DFlashModel(nn.Module):
                 dim=(0, 1)
             ) / count_per_pos
 
-        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
+        loss_components = {}
+        return (
+            loss,
+            accuracy,
+            loss_per_position,
+            acc_per_position,
+            count_per_position,
+            loss_components,
+        )

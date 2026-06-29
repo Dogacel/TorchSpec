@@ -45,8 +45,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from torchspec.models.dflash import DFlashModel, _create_dflash_mask_mod
-from torchspec.models.ops.flex_attention import compile_friendly_create_block_mask
+from torchspec.models.dflash import DFlashModel
 
 
 class DSparkModel(DFlashModel):
@@ -108,43 +107,9 @@ class DSparkModel(DFlashModel):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        # ---- DFlash backbone (identical to DFlashModel.forward steps 1-7) ----
-        context_feature = self.draft_model.extract_context_feature(hidden_states_list)
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
-        )
-        n_blocks = anchor_positions.shape[1]
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
-        context_position_ids, draft_position_ids = self._create_position_ids(
-            anchor_positions, seq_len
-        )
-
-        draft_len = n_blocks * self.block_size
-        kv_len = seq_len + draft_len
-        block_mask = None
-        if device.type == "cuda":
-            mask_mod = _create_dflash_mask_mod(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                ctx_len=seq_len,
-                block_size=self.block_size,
-            )
-            block_mask = compile_friendly_create_block_mask(
-                mask_mod=mask_mod,
-                B=bsz,
-                H=None,
-                Q_LEN=draft_len,
-                KV_LEN=kv_len,
-                device=device,
-            )
-
-        draft_hidden = self.draft_model(
-            draft_input_ids=None,
-            context_feature=context_feature,
-            draft_position_ids=draft_position_ids,
-            context_position_ids=context_position_ids,
-            block_mask=block_mask,
-            noise_embedding=noise_embedding,
+        # ---- Shared DFlash backbone (steps 1-6) → draft hidden states ----
+        draft_hidden, anchor_positions, block_keep_mask, n_blocks = self._draft_backbone(
+            input_ids, hidden_states_list, loss_mask
         )
         hidden_4d = draft_hidden.view(bsz, n_blocks, self.block_size, -1)
 

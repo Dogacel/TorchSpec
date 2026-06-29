@@ -427,7 +427,7 @@ class TestDFlashModelForward(unittest.TestCase):
         lm_head_weight = torch.randn(self.V, self.H)
 
         with torch.no_grad():
-            loss, acc, loss_pp, acc_pp, count_pp = self.model(
+            loss, acc, loss_pp, acc_pp, count_pp, loss_components = self.model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -441,6 +441,7 @@ class TestDFlashModelForward(unittest.TestCase):
         self.assertEqual(loss_pp.shape, (self.model.block_size,))
         self.assertEqual(acc_pp.shape, (self.model.block_size,))
         self.assertEqual(count_pp.shape, (self.model.block_size,))
+        self.assertEqual(loss_components, {})
 
     def test_loss_requires_grad(self):
         """Loss should be differentiable through the draft model."""
@@ -453,7 +454,7 @@ class TestDFlashModelForward(unittest.TestCase):
         lm_head_weight = torch.randn(self.V, self.H)
 
         self.model.train()
-        loss, acc, _, _, _ = self.model(
+        loss, acc, *_ = self.model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
@@ -721,7 +722,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
         losses = []
         for step in range(10):
             optimizer.zero_grad()
-            loss, acc, _, _, _ = model(
+            loss, acc, *_ = model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -1061,7 +1062,7 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         losses, accs = [], []
         for _ in range(steps):
             optimizer.zero_grad()
-            loss, acc, _, _, _ = model(
+            loss, acc, *_ = model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -1200,7 +1201,7 @@ class TestDFlashVsEagle3Architecture(unittest.TestCase):
         lm_head_weight = torch.randn(V, H)
 
         with torch.no_grad():
-            loss, acc, _, _, _ = model(
+            loss, acc, *_ = model(
                 input_ids=input_ids,
                 hidden_states_list=hs_list,
                 loss_mask=loss_mask,
@@ -1348,6 +1349,88 @@ class TestDFlashHotfixes(unittest.TestCase):
         block_size = 16
         min_loss = 32  # == 2 * 16
         self.assertGreaterEqual(min_loss, 2 * block_size)
+
+
+class TestExtraLossComponentAggregation(unittest.TestCase):
+    class _DummyOptimizer:
+        def get_learning_rate(self):
+            return 1e-3
+
+    def _make_dspark_trainer(self):
+        from torchspec.training.dspark_trainer import DSparkTrainer
+
+        trainer = object.__new__(DSparkTrainer)
+        trainer.loss_decay_gamma = 1.0
+        trainer.global_step = 0
+        trainer.optimizer = self._DummyOptimizer()
+        return trainer
+
+    @staticmethod
+    def _steps(loss_key, acc_key, count_key):
+        base = {
+            loss_key: torch.tensor([0.0, 1.0, 3.0]),
+            acc_key: torch.tensor([0.0, 0.5, 1.0]),
+            count_key: torch.tensor([0.0, 4.0, 4.0]),
+        }
+        return [
+            {
+                **base,
+                "ce_loss": torch.tensor(2.0),
+                "l1_loss": torch.tensor(0.4),
+                "confidence_loss": torch.tensor(0.1),
+            },
+            {
+                **base,
+                "ce_loss": torch.tensor(4.0),
+                "l1_loss": torch.tensor(0.6),
+                "confidence_loss": torch.tensor(0.3),
+            },
+        ]
+
+    def test_dspark_keys_declared(self):
+        from torchspec.training.dspark_trainer import DSparkTrainer
+
+        self.assertEqual(
+            DSparkTrainer._extra_loss_component_keys,
+            ["ce_loss", "l1_loss", "confidence_loss"],
+        )
+
+    def test_dflash_declares_no_components(self):
+        from torchspec.training.dflash_trainer import DFlashTrainer
+
+        self.assertEqual(DFlashTrainer._extra_loss_component_keys, [])
+        trainer = object.__new__(DFlashTrainer)
+        # No keys to reduce → no-op even if components are present in the steps.
+        out = trainer._reduce_loss_components([{"ce_loss": torch.tensor(1.0)}], "train/")
+        self.assertEqual(out, {})
+
+    @mock.patch("torchspec.training.dflash_trainer.dist.get_rank", return_value=0)
+    @mock.patch(
+        "torchspec.training.dflash_trainer.dist.all_reduce",
+        side_effect=lambda tensor, op=None: None,
+    )
+    def test_components_in_train_metrics(self, _mock_all_reduce, _mock_get_rank):
+        trainer = self._make_dspark_trainer()
+        metrics = trainer._aggregate_metrics(
+            self._steps("loss_per_position", "acc_per_position", "count_per_position"),
+            step=1,
+            grad_norm=torch.tensor(1.0),
+        )
+        self.assertAlmostEqual(metrics["train/ce_loss"], 3.0, places=6)
+        self.assertAlmostEqual(metrics["train/l1_loss"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["train/confidence_loss"], 0.2, places=6)
+
+    @mock.patch("torchspec.training.dflash_trainer.dist.get_rank", return_value=0)
+    @mock.patch(
+        "torchspec.training.dflash_trainer.dist.all_reduce",
+        side_effect=lambda tensor, op=None: None,
+    )
+    def test_components_in_eval_metrics(self, _mock_all_reduce, _mock_get_rank):
+        trainer = self._make_dspark_trainer()
+        metrics = trainer._aggregate_eval_metrics(self._steps("loss_pp", "acc_pp", "count_pp"))
+        self.assertAlmostEqual(metrics["eval/ce_loss"], 3.0, places=6)
+        self.assertAlmostEqual(metrics["eval/l1_loss"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["eval/confidence_loss"], 0.2, places=6)
 
 
 if __name__ == "__main__":
