@@ -73,17 +73,22 @@ if [ "$BACKEND" = "sglang" ] || [ "$BACKEND" = "both" ]; then
     echo "Installing SGLang..."
     echo "=========================================="
 
-    SGLANG_VERSION="${SGLANG_VERSION:-v0.5.14}"
-    SGLANG_COMMIT=4289f36ef960fad8268a6b94935686e792a81432
-    SGLANG_FOLDER_NAME="_sglang"
+    # Resolve SGLANG_VERSION / SGLANG_COMMIT / paths from the single source of truth.
+    # shellcheck source=tools/sglang_lib.sh
+    source "$SCRIPT_DIR/sglang_lib.sh"
+
+    if [ -z "$SGLANG_COMMIT" ]; then
+        echo "Error: Could not find base commit in $SGLANG_DIR/SGLANG_COMMIT"
+        exit 1
+    fi
 
     # Install sglang inside the conda environment
-    if [ ! -d "$PROJECT_ROOT/$SGLANG_FOLDER_NAME" ]; then
-        git clone https://github.com/sgl-project/sglang.git "$PROJECT_ROOT/$SGLANG_FOLDER_NAME"
+    if [ ! -d "$SGLANG_PATH" ]; then
+        git clone https://github.com/sgl-project/sglang.git "$SGLANG_PATH"
     fi
 
     # Avoid pythonpath conflict, because we are using the offline engine.
-    cd "$PROJECT_ROOT/$SGLANG_FOLDER_NAME"
+    cd "$SGLANG_PATH"
     git checkout $SGLANG_COMMIT
     git reset --hard HEAD
 
@@ -95,10 +100,10 @@ if [ "$BACKEND" = "sglang" ] || [ "$BACKEND" = "both" ]; then
         pip install -e "${SGLANG_FOLDER_NAME}/python[all]"
     fi
 
-    cd "$PROJECT_ROOT/$SGLANG_FOLDER_NAME"
+    cd "$SGLANG_PATH"
 
     # Apply sglang patch (matches Docker build behavior)
-    git apply "$PROJECT_ROOT/patches/sglang/$SGLANG_VERSION/sglang.patch"
+    git apply "$SGLANG_PATCH_FILE"
 
     cd "$PROJECT_ROOT"
 fi

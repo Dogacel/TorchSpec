@@ -142,6 +142,10 @@ Single-node tensor parallelism only for now (multi-node TP is not yet wired up).
 
 TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model forward pass and capture hidden states directly inside worker processes, which avoids RPC serialization overhead during extraction. For SGLang, TorchSpec applies a patch to the existing codebase to enable hidden-state extraction. For TensorRT-LLM, TorchSpec builds on its native **SaveHiddenStates** speculative mode and applies a small patch that redirects the captured aux + final hidden states to Mooncake instead of writing them to disk.
 
+### Updating the SGLang patch
+
+Commit your changes in the `_sglang` checkout, then regenerate `patches/sglang/<version>/sglang.patch` from the pinned base commit with `./tools/update_sglang_patch.sh`.
+
 ## Examples
 
 | Example | Backend | Model |

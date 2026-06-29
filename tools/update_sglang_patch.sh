@@ -5,38 +5,9 @@ set -e
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
-SGLANG_VERSION="${SGLANG_VERSION:-v0.5.14}"
-SGLANG_DIR="$PROJECT_ROOT/docker/sglang/$SGLANG_VERSION"
+# shellcheck source=tools/sglang_lib.sh
+source "$SCRIPT_DIR/sglang_lib.sh"
 
-if [ ! -d "$SGLANG_DIR" ]; then
-    echo "Error: sglang version directory not found: $SGLANG_DIR"
-    exit 1
-fi
-
-SGLANG_COMMIT=$(grep "^ARG SGLANG_COMMIT=" "$SGLANG_DIR/Dockerfile" | cut -d= -f2)
-# Newer Dockerfiles (v0.5.14+) pin a prebuilt image via `ARG SGLANG_IMAGE=...`
-# and carry no `ARG SGLANG_COMMIT` line. Fall back to the commit pinned in
-# build_conda.sh (where the assignment may be indented inside a function).
-if [ -z "$SGLANG_COMMIT" ]; then
-    SGLANG_COMMIT=$(grep -E "^[[:space:]]*SGLANG_COMMIT=" "$SCRIPT_DIR/build_conda.sh" | head -1 | cut -d= -f2 | tr -d '"' | tr -d '[:space:]')
-fi
-SGLANG_FOLDER_NAME="${SGLANG_FOLDER_NAME:-$(grep "^SGLANG_FOLDER_NAME=" "$SCRIPT_DIR/build_conda.sh" | cut -d= -f2 | tr -d '"')}"
-
-if [ -z "$SGLANG_COMMIT" ]; then
-    echo "Error: Could not find SGLANG_COMMIT in $SGLANG_DIR/Dockerfile or build_conda.sh"
-    exit 1
-fi
-
-if [ -z "$SGLANG_FOLDER_NAME" ]; then
-    echo "Warning: SGLANG_FOLDER_NAME not found in build_conda.sh, using default '_sglang'"
-    SGLANG_FOLDER_NAME="_sglang"
-fi
-
-if [[ "$SGLANG_FOLDER_NAME" = /* ]]; then
-    SGLANG_PATH="$SGLANG_FOLDER_NAME"
-else
-    SGLANG_PATH="$PROJECT_ROOT/$SGLANG_FOLDER_NAME"
-fi
 
 echo "SGLANG_VERSION: $SGLANG_VERSION"
 echo "SGLANG_COMMIT: $SGLANG_COMMIT"
@@ -92,9 +63,7 @@ if [ "$has_uncommitted" = true ]; then
     exit 1
 fi
 
-PATCH_DIR="$PROJECT_ROOT/patches/sglang/$SGLANG_VERSION"
-mkdir -p "$PATCH_DIR"
-PATCH_FILE="$PATCH_DIR/sglang.patch"
+mkdir -p "$SGLANG_PATCH_DIR"
 
 echo "Generating patch from $SGLANG_COMMIT to HEAD..."
 # Write diffstat header as a comment, then the actual diff.
@@ -106,14 +75,14 @@ echo "Generating patch from $SGLANG_COMMIT to HEAD..."
     git diff --stat "$SGLANG_COMMIT" HEAD
     echo ""
     git diff "$SGLANG_COMMIT" HEAD
-} > "$PATCH_FILE"
+} > "$SGLANG_PATCH_FILE"
 
-if [ ! -s "$PATCH_FILE" ]; then
+if [ ! -s "$SGLANG_PATCH_FILE" ]; then
     echo "Error: Failed to generate patch or patch is empty"
     exit 1
 fi
 
-PATCH_SIZE=$(wc -l < "$PATCH_FILE")
+PATCH_SIZE=$(wc -l < "$SGLANG_PATCH_FILE")
 echo "✓ Patch updated successfully: patches/sglang/$SGLANG_VERSION/sglang.patch ($PATCH_SIZE lines)"
 
 echo ""

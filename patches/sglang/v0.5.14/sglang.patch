@@ -1,4 +1,4 @@
-torchspec sglang patch (base: 4289f36ef9)
+torchspec sglang patch (base: 49e384ce9d)
 ---
  python/sglang/srt/entrypoints/engine.py            |   8 ++
  python/sglang/srt/entrypoints/http_server.py       |  17 +++

@@ -58,32 +58,17 @@ git clone https://github.com/torchspec-project/TorchSpec.git
 cd TorchSpec
 ```
 
-### Step 2: Install SGLang 0.5.9
+### Step 2: Install TorchSpec (with the SGLang backend)
 
-SGLang provides the inference engine and pulls in PyTorch 2.9.1:
-
-```bash
-pip install "sglang[all]==0.5.9" --find-links https://flashinfer.ai/whl/cu124/torch2.9/flashinfer-python
-```
-
-### Step 3: Apply SGLang patch
-
-The patch adds speculative training hooks (`enable_aux_hidden_states`, etc.):
+Follow the [TorchSpec setup instructions](../../README.md#setup).
 
 ```bash
-SGLANG_DIR=$(python -c "import sglang; print(sglang.__path__[0])")
-cd "$(dirname "$SGLANG_DIR")"
-git apply /path/to/TorchSpec/patches/sglang/v0.5.8.post1/sglang.patch
-cd /path/to/TorchSpec
+./tools/build_conda.sh           # creates a `torchspec` env with the SGLang backend
+# or, into the current environment:
+./tools/build_conda.sh current sglang
 ```
 
-### Step 4: Install TorchSpec
-
-```bash
-pip install -e ".[dev]"
-```
-
-### Step 5: Set environment variables
+### Step 3: Set environment variables
 
 These are **required** for correct training behavior:
 
@@ -93,7 +78,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON
 ```
 
-### Step 6: Verify installation
+### Step 4: Verify installation
 
 ```bash
 python -c "
@@ -282,7 +267,6 @@ Defined in `torchspec/config/dflash_draft_config.json`:
 | Issue | Symptom | Fix |
 |-------|---------|-----|
 | Missing RDMA libs | `ImportError: libibverbs.so.1` | Install system libs (see Prerequisites) |
-| SGLang patch not applied | `unexpected keyword argument 'enable_aux_hidden_states'` | Re-apply the SGLang patch (Step 3) |
 | Slow training (3x expected) | step time >3 s | Set `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON` |
 | OOM on A100 40GB | CUDA out of memory | Use H100/A100 80GB, or reduce `max_seq_length` / `dflash_num_anchors` |
 | Loss stuck at ~10 | No convergence after 500 steps | Check data format, ensure conversations have assistant turns |
