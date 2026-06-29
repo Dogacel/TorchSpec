@@ -245,7 +245,7 @@ def _get_draft_model_config(args):
 
 
 def _validate_and_configure_dflash(args, draft_model_config) -> None:
-    """Validate 
+    """Validate
     -specific config and auto-set aux layer IDs.
 
     Called before dataset loading to fail fast on misconfigurations.
