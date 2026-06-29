@@ -109,6 +109,8 @@ class DFlashModel(nn.Module):
         loss_objective: str = "decay",
         dpace_alpha: float = 0.5,
         loss_decay_gamma: float = 7.0,
+        ce_loss_alpha: float = 1.0,
+        l1_loss_alpha: float = 0.0,
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -126,6 +128,8 @@ class DFlashModel(nn.Module):
         self.loss_objective = loss_objective
         self.dpace_alpha = dpace_alpha
         self.loss_decay_gamma = loss_decay_gamma
+        self.ce_loss_alpha = float(ce_loss_alpha)
+        self.l1_loss_alpha = float(l1_loss_alpha)
 
     def _sample_anchor_positions(
         self,
@@ -384,11 +388,31 @@ class DFlashModel(nn.Module):
         # our objective weighting is an addition to the training signal, not the metric.
         binary_eval_mask = weight_mask.view(-1)
 
-        # 9. Cross entropy loss
-        flat_logits = logits.view(-1, logits.size(-1))
+        # 9. Per-token loss: ce_loss_alpha*CE + l1_loss_alpha*L1.
+        vocab_size = logits.size(-1)
+        flat_logits = logits.view(-1, vocab_size)
         flat_targets = target_ids.view(-1)
-        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        loss_per_token_by_position = loss_per_token.view(bsz, n_blocks, self.block_size)
+        ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+
+        loss_per_token = self.ce_loss_alpha * ce_per_token
+        if self.l1_loss_alpha > 0:
+            if last_hidden_states is None:
+                raise ValueError(
+                    "DFlash L1 distillation (l1_loss_alpha > 0) requires target "
+                    "last_hidden_states; set inference.store_last_hidden_states=true in the "
+                    "run config."
+                )
+            tgt_idx = (safe_label_indices - 1).clamp(min=0)  # [B, n_blocks, block_size]
+            hdim = last_hidden_states.size(-1)
+            gather_idx = tgt_idx.reshape(bsz, -1, 1).expand(-1, -1, hdim)
+            aligned_hidden = torch.gather(last_hidden_states, 1, gather_idx)
+            target_logits = F.linear(aligned_hidden, lm_head_weight).view(-1, vocab_size)
+            target_probs = torch.softmax(target_logits.float(), dim=-1)
+            draft_probs = torch.softmax(flat_logits.float(), dim=-1)
+            l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
+            loss_per_token = loss_per_token + self.l1_loss_alpha * l1_per_token
+
+        loss_per_token_by_position = ce_per_token.view(bsz, n_blocks, self.block_size)
 
         objective_weights = weight_mask
         if (
@@ -430,9 +454,9 @@ class DFlashModel(nn.Module):
             count_per_position = binary_weights.sum(dim=(0, 1))
             count_per_pos = count_per_position.clamp(min=1.0)
 
-            loss_per_position = (
-                loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights
-            ).sum(dim=(0, 1)) / count_per_pos
+            loss_per_position = (loss_per_token_by_position * binary_weights).sum(
+                dim=(0, 1)
+            ) / count_per_pos
             acc_per_position = (correct.view(bsz, n_blocks, self.block_size).float()).sum(
                 dim=(0, 1)
             ) / count_per_pos

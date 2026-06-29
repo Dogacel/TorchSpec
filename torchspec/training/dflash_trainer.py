@@ -65,6 +65,8 @@ class DFlashTrainer(Trainer):
             loss_objective=self.loss_objective,
             dpace_alpha=self.dpace_alpha,
             loss_decay_gamma=self.loss_decay_gamma,
+            ce_loss_alpha=self.ce_loss_alpha,
+            l1_loss_alpha=self.l1_loss_alpha,
         )
 
     def __init__(self, args: Namespace):
@@ -76,6 +78,8 @@ class DFlashTrainer(Trainer):
         self.loss_objective = getattr(args, "dflash_loss_objective", "decay")
         self.dpace_alpha = getattr(args, "dflash_dpace_alpha", 0.5)
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
+        self.ce_loss_alpha = getattr(args, "dflash_ce_loss_alpha", 1.0)
+        self.l1_loss_alpha = getattr(args, "dflash_l1_loss_alpha", 0.0)
 
     def init_model(
         self,
