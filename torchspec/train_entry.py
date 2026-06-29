@@ -245,7 +245,8 @@ def _get_draft_model_config(args):
 
 
 def _validate_and_configure_dflash(args, draft_model_config) -> None:
-    """Validate DFlash-specific config and auto-set aux layer IDs.
+    """Validate 
+    -specific config and auto-set aux layer IDs.
 
     Called before dataset loading to fail fast on misconfigurations.
     """
@@ -260,9 +261,9 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
     algo = "DSpark" if is_dspark else "DFlash"
 
     engine_type = getattr(args, "inference_engine_type", "hf")
-    if engine_type not in ("vllm", "sgl"):
+    if engine_type not in ("vllm", "sgl", "trtllm"):
         raise NotImplementedError(
-            f"{algo} supports inference_engine_type in ('vllm', 'sgl'), got '{engine_type}'."
+            f"{algo} supports inference_engine_type in ('vllm', 'sgl', 'trtllm'), got '{engine_type}'."
         )
     if getattr(args, "defer_tokenization", False):
         raise NotImplementedError("DFlash does not support defer_tokenization=True.")

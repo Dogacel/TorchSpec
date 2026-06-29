@@ -22,6 +22,14 @@ Draft models trained with TorchSpec, available from other organizations:
 
 - [Inferact/MiniMax-M3-EAGLE3](https://huggingface.co/Inferact/MiniMax-M3-EAGLE3)
 
+## Adoption
+
+TorchSpec has been adopted by production inference platforms and the vLLM ecosystem:
+
+- [DigitalOcean](https://www.digitalocean.com/blog/how-we-built-fastest-deepseek-minimax-qwen-on-blackwell-ultra) used TorchSpec to train an EAGLE3 draft model for MiniMax-M2.5 on DigitalOcean Serverless Inference.
+- [vLLM](https://vllm.ai/blog/2026-05-11-vllm-tops-artificial-analysis) used TorchSpec and vLLM to train the custom EAGLE3 draft model featured in its Artificial Analysis leaderboard work.
+- [CoreWeave](https://www.coreweave.com/blog/kimi-k2-7-code-now-available-on-serverless-inference-with-leading-benchmark-price-performance) used TorchSpec to train a DFlash speculative decoding model for Kimi K2.7 Code and contributed D-PACE support upstream.
+
 ## 🚀 Blogs
 
 ## Blogs and Announcements
@@ -64,6 +72,7 @@ TorchSpec streams hidden states from inference engines into training workers.
 |---------|--------------|--------|
 | [vLLM](https://github.com/vllm-project/vllm) | First-class | Available |
 | [TokenSpeed](https://github.com/lightseekorg/tokenspeed) | First-class | In progress |
+| [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | First-class | Available |
 | [SGLang](https://github.com/sgl-project/sglang) | Best community effort | Available |
 | [HuggingFace Transformers](https://github.com/huggingface/transformers) | Best community effort | Available |
 
@@ -112,7 +121,7 @@ pip install -e ".[fa]"
 **vLLM**
 
 ```bash
-./examples/qwen3-8b-single-node/run.sh --config configs/vllm_qwen3_8b.yaml
+./examples/qwen3-8b-single-node/run.sh configs/vllm_qwen3_8b.yaml
 ```
 
 **SGLang**
@@ -121,7 +130,17 @@ pip install -e ".[fa]"
 ./examples/qwen3-8b-single-node/run.sh
 ```
 
-TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model forward pass and capture hidden states directly inside worker processes, which avoids RPC serialization overhead during extraction. For SGLang, TorchSpec applies a patch to the existing codebase to enable hidden-state extraction.
+**TensorRT-LLM**
+
+Run inside the TensorRT-LLM image (`docker/trtllm/v1.3.0rc18/Dockerfile`), which ships `tensorrt_llm` pre-patched for Mooncake hidden-state capture:
+
+```bash
+./examples/qwen3-8b-single-node/run.sh configs/trtllm_qwen3_8b.yaml
+```
+
+Single-node tensor parallelism only for now (multi-node TP is not yet wired up).
+
+TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model forward pass and capture hidden states directly inside worker processes, which avoids RPC serialization overhead during extraction. For SGLang, TorchSpec applies a patch to the existing codebase to enable hidden-state extraction. For TensorRT-LLM, TorchSpec builds on its native **SaveHiddenStates** speculative mode and applies a small patch that redirects the captured aux + final hidden states to Mooncake instead of writing them to disk.
 
 ## Examples
 

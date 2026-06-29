@@ -37,6 +37,14 @@ else
     CONFIG_FILE="$ROOT_DIR/configs/sglang_qwen3_8b.yaml"
 fi
 
+# Derive the tp_size override block from the config's engine type ("sgl" -> "sglang").
+# `|| true` so a config without a literal inference_engine_type line falls back below instead of tripping set -e.
+ENGINE_TYPE=$(grep -oE "inference_engine_type:[[:space:]]*[a-zA-Z]+" "$CONFIG_FILE" | awk '{print $2}' || true)
+case "$ENGINE_TYPE" in
+    sgl) TP_BLOCK=sglang ;;
+    *)   TP_BLOCK="${ENGINE_TYPE:-sglang}" ;;
+esac
+
 IFS=',' read -ra GPU_ARRAY <<< "$CUDA_VISIBLE_DEVICES"
 TOTAL_GPUS=${#GPU_ARRAY[@]}
 
@@ -68,7 +76,7 @@ python3 -m torchspec.train_entry \
     inference.inference_num_gpus="$INFERENCE_GPUS" \
     inference.inference_num_gpus_per_engine=2 \
     inference.inference_num_gpus_per_node="$TOTAL_GPUS" \
-    inference.sglang.tp_size=2 \
+    inference.${TP_BLOCK}.tp_size=2 \
     "$@"
 
 echo "=============================================="

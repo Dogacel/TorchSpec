@@ -306,6 +306,7 @@ _PREFIXED_SECTIONS = {
     "mooncake": "mooncake_",
     "sglang": "sglang_",
     "vllm": "vllm_",
+    "trtllm": "trtllm_",
 }
 
 
