@@ -126,9 +126,13 @@ class _EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
 
 # ── Export fixups ────────────────────────────────────────────────────────────
 
-# vLLM checkpoints use `layers.0.xxx` for the single decoder layer,
-# while our training code uses `midlayer.xxx`.
-_WEIGHT_KEY_REMAP = [("midlayer.", "layers.0.")]
+# vLLM / SGLang supports a different naming convention for some weight keys.
+_WEIGHT_KEY_REMAP = [
+    ("midlayer.", "layers.0."),
+    ("context_proj.", "fc."),
+    ("context_norm.", "hidden_norm."),
+    ("final_norm.", "norm."),
+]
 
 
 def _remap_weight_keys(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -143,6 +147,11 @@ def _remap_weight_keys(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tens
     return remapped
 
 
+_MODEL_TYPE_REMAP = {
+    "qwen3_dspark": "qwen3",
+}
+
+
 def _fixup_export_config(raw_config: dict, export_for_vllm: bool = False) -> dict:
     """Apply model-type-specific fixups to the exported config."""
     config = json.loads(json.dumps(raw_config))
@@ -155,6 +164,9 @@ def _fixup_export_config(raw_config: dict, export_for_vllm: bool = False) -> dic
         eagle_cfg = config.get("eagle_config")
         if eagle_cfg and key in eagle_cfg:
             eagle_cfg[key] = [x + 1 for x in eagle_cfg[key]]
+
+    if config["model_type"] in _MODEL_TYPE_REMAP:
+        config["model_type"] = _MODEL_TYPE_REMAP[config["model_type"]]
 
     return config
 
@@ -247,20 +259,17 @@ def _extract_model_weights(
     return model_state
 
 
-def _prepare_export_tensors(hf_model, export_for_vllm: bool) -> dict[str, torch.Tensor]:
+def _prepare_export_tensors(hf_model) -> dict[str, torch.Tensor]:
     tensors = hf_model.state_dict()
-    if export_for_vllm:
-        logger.info("Exporting vLLM-compatible checkpoint keys")
-        return _remap_weight_keys(tensors)
     logger.info("Exporting native checkpoint keys")
-    return dict(tensors)
+    return _remap_weight_keys(tensors)
 
 
 def _save_without_vocab_pruning(
     hf_model, output_dir: str, raw_config: dict, vocab_size: int, export_for_vllm: bool = False
 ) -> None:
     version = _get_torchspec_version()
-    tensors = _prepare_export_tensors(hf_model, export_for_vllm)
+    tensors = _prepare_export_tensors(hf_model)
     save_file(
         tensors,
         os.path.join(output_dir, "model.safetensors"),

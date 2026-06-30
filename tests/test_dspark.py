@@ -118,7 +118,7 @@ class TestDSparkConfig(unittest.TestCase):
     def test_subclasses_dflash_and_attrs(self):
         cfg = _make_dspark_config(markov_rank=32)
         self.assertIsInstance(cfg, DFlashConfig)  # ordering hazard: check DSpark first
-        self.assertEqual(cfg.model_type, "dspark")
+        self.assertEqual(cfg.model_type, "qwen3_dspark")
         self.assertEqual(cfg.markov_rank, 32)
         self.assertTrue(cfg.enable_confidence_head)
 
@@ -235,8 +235,8 @@ class TestDispatch(unittest.TestCase):
     def test_json_resolves_to_dspark_config(self):
         cfg = AutoDraftModelConfig.from_dict(
             {
-                "architectures": ["DSparkDraftModel"],
-                "model_type": "dspark",
+                "architectures": ["Qwen3DSparkModel"],
+                "model_type": "qwen3_dspark",
                 "hidden_size": 64,
                 "vocab_size": 128,
                 "num_hidden_layers": 1,

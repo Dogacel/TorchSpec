@@ -79,7 +79,7 @@ class AutoDraftModelConfig:
         "LlamaForCausalLMEagle3": LlamaConfig,
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
         "DFlashDraftModel": DFlashConfig,
-        "DSparkDraftModel": DSparkConfig,
+        "Qwen3DSparkModel": DSparkConfig,
     }
 
     @classmethod

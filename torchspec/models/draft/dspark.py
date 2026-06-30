@@ -48,7 +48,7 @@ class DSparkConfig(DFlashConfig):
     Configuration for the DSpark draft model. Extends :class:`DFlashConfig`.
     """
 
-    model_type = "dspark"
+    model_type = "qwen3_dspark"
 
     def __init__(
         self,
@@ -79,6 +79,7 @@ class VanillaMarkov(nn.Module):
             f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
         )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
+        # TODO: markow_w2 out_features should match "draft_vocab_size" if pruning is used.
         self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
