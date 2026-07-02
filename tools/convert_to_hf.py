@@ -58,6 +58,7 @@ from tqdm import tqdm
 from typing_extensions import override
 
 from torchspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
+from torchspec.models.draft.keymap import DRAFT_WEIGHT_KEY_REMAP
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,19 +128,13 @@ class _EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
 # ── Export fixups ────────────────────────────────────────────────────────────
 
 # vLLM / SGLang supports a different naming convention for some weight keys.
-_WEIGHT_KEY_REMAP = [
-    ("midlayer.", "layers.0."),
-    ("context_proj.", "fc."),
-    ("context_norm.", "hidden_norm."),
-    ("final_norm.", "norm."),
-]
 
 
 def _remap_weight_keys(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     remapped = {}
     for k, v in tensors.items():
         new_key = k
-        for old_prefix, new_prefix in _WEIGHT_KEY_REMAP:
+        for old_prefix, new_prefix in DRAFT_WEIGHT_KEY_REMAP:
             if k.startswith(old_prefix):
                 new_key = new_prefix + k[len(old_prefix) :]
                 break

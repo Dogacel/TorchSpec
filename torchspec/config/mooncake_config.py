@@ -63,6 +63,7 @@ class MooncakeConfig:
     get_batch_size: int = 1
     max_seq_len: int = 8192
     hidden_dim: int = 4096
+    num_aux_layers: int = 3
     async_put_pool_size: int | None = None
     store_full_error_codes: Tuple[int, ...] = (-200,)
     store_full_wait_seconds: float = 0.5
@@ -91,6 +92,7 @@ class MooncakeConfig:
                 max_seq_len=self.max_seq_len,
                 batch_size=1,
                 hidden_dim=self.hidden_dim,
+                num_aux_layers=self.num_aux_layers,
                 safety_margin=2.0,
             )
 
@@ -104,7 +106,23 @@ class MooncakeConfig:
                 max_seq_len=self.max_seq_len,
                 batch_size=self.get_batch_size,
                 hidden_dim=self.hidden_dim,
+                num_aux_layers=self.num_aux_layers,
             )
+
+    @staticmethod
+    def _infer_num_aux_layers(args) -> int:
+        draft_cfg = getattr(args, "draft_model_config_obj", None)
+        if draft_cfg is not None:
+            target_layer_ids = getattr(draft_cfg, "target_layer_ids", None)
+            if target_layer_ids:
+                return len(target_layer_ids)
+            num_target_layers = getattr(draft_cfg, "num_target_layers", None)
+            if num_target_layers:
+                return int(num_target_layers)
+        aux_layers = getattr(args, "aux_hidden_states_layers", None)
+        if aux_layers:
+            return len(aux_layers)
+        return 3
 
     @classmethod
     def from_flat_args(cls, args) -> "MooncakeConfig":
@@ -154,6 +172,7 @@ class MooncakeConfig:
                 getattr(args, "max_seq_length", 8192),
             ),
             "hidden_dim": getattr(args, "mooncake_hidden_dim", 4096),
+            "num_aux_layers": cls._infer_num_aux_layers(args),
         }
 
         if metadata_server is not None:
@@ -174,6 +193,7 @@ class MooncakeConfig:
         os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = str(self.global_segment_size)
         os.environ["MOONCAKE_LOCAL_BUFFER_SIZE"] = str(self.local_buffer_size)
         os.environ["MOONCAKE_HOST_BUFFER_SIZE"] = str(self.host_buffer_size)
+        os.environ["MOONCAKE_NUM_AUX_LAYERS"] = str(self.num_aux_layers)
         os.environ["MOONCAKE_PROTOCOL"] = self.protocol
         os.environ["MOONCAKE_DEVICE_NAME"] = self.device_name
         os.environ["MOONCAKE_ENABLE_GPU_DIRECT"] = "1" if self.enable_gpu_direct else "0"
@@ -225,6 +245,8 @@ class MooncakeConfig:
         pool_size_env = os.getenv("MOONCAKE_ASYNC_PUT_POOL_SIZE")
         async_put_pool_size = int(pool_size_env) if pool_size_env is not None else None
 
+        num_aux_layers = int(os.getenv("MOONCAKE_NUM_AUX_LAYERS", "3"))
+
         return cls(
             local_hostname=os.getenv("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
             metadata_server=os.getenv(
@@ -239,6 +261,7 @@ class MooncakeConfig:
             ),
             local_buffer_size=int(os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", str(512 * 1024 * 1024))),
             host_buffer_size=host_buffer_size,
+            num_aux_layers=num_aux_layers,
             async_put_pool_size=async_put_pool_size,
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE_NAME", ""),

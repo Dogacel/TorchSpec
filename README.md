@@ -191,6 +191,25 @@ training:
 output_dir: /path/to/new_run
 ```
 
+Start a new run from an existing Hugging Face checkpoint. `--input` accepts a Hugging Face Hub repo id (downloaded automatically), a local HF/safetensors directory or `.safetensors` file, or a TorchSpec DCP checkpoint dir:
+
+```bash
+python tools/convert_to_torchspec.py \
+    --input org/dflash-checkpoint \
+    --config torchspec/config/dspark_draft_config_qwen36_35b.json \
+    --output ./outputs/dspark_init
+```
+
+Then warm-start from the generated init:
+
+```yaml
+training:
+  load_path: ./outputs/dspark_init
+  continual_training: true
+```
+
+Using this technique, you can also warm-start DSpark training runs from a pre-trained DFlash model for faster convergence.
+
 ## Checkpoint Conversion
 
 Convert an FSDP checkpoint to HuggingFace format:
@@ -229,9 +248,13 @@ Set `TORCHSPEC_LOG_LEVEL=DEBUG` for more verbose logging when diagnosing issues:
 TORCHSPEC_LOG_LEVEL=DEBUG ./examples/qwen3-8b-single-node/run.sh
 ```
 
-## Mooncake SEGFAULT
+### Mooncake SEGFAULT
 
 Current Mooncake version has a bug with TCP-only hosts causing a SEGFAULT error. Set `MC_STORE_MEMCPY=0` until the [upstream issue](https://github.com/kvcache-ai/Mooncake/issues/1986) is fixed.
+
+### RDMA failure
+
+If you get the error `... libcudart symbols not found globally. Make sure PyTorch with CUDA is installed before using TileLang`, reinstall mooncake to match your system CUDA version, i.e. if you run on CUDA 13, mooncake is probably installed for cu12 wheels, re-install it using `uv pip uninstall mooncake-transfer-engine && uv pip install mooncake-transfer-engine-cuda13`.
 
 ### Per-Rank File Logging
 
