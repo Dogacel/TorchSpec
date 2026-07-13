@@ -76,8 +76,6 @@ from torchspec.ray.placement_group import (  # noqa: E402
 def _make_args(**overrides):
     defaults = dict(
         placement_strategy="training_first",
-        debug_train_only=False,
-        debug_inference_only=False,
         colocate=False,
         training_num_nodes=1,
         training_num_gpus_per_node=2,
@@ -280,3 +278,64 @@ def test_custom_colocate_uses_training_topology_for_inference_constraints():
     assert kwargs["node_group_indices"] == [0, 0, 0, 0, 1, 1, 1, 1]
     assert result["training"] == (fake_pg, list(range(8)), list(range(8)))
     assert result["inference"] == (fake_pg, list(range(8)), list(range(8)))
+
+
+def test_inference_only_placement_reserves_only_inference_gpus():
+    args = _make_args(inference_num_gpus=2)
+    fake_pg = MagicMock(name="pg")
+
+    with (
+        patch("torchspec.ray.placement_group._ensure_ray_initialized"),
+        patch("torchspec.ray.placement_group._wait_for_gpu_resources") as wait_for_gpus,
+        patch(
+            "torchspec.ray.placement_group._create_placement_group",
+            return_value=(fake_pg, [0, 1], [0, 1]),
+        ) as create_pg,
+    ):
+        result = create_placement_groups(args, roles={"inference"})
+
+    wait_for_gpus.assert_called_once_with(2)
+    create_pg.assert_called_once_with(2, strategy="PACK", name="inference_pg")
+    assert result["training"] == (fake_pg, [], [])
+    assert result["inference"] == (fake_pg, [0, 1], [0, 1])
+
+
+def test_training_only_placement_ignores_role_ordering_strategy():
+    args = _make_args(
+        inference_engine_type="offline",
+        placement_strategy="inference_first",
+        inference_num_gpus=8,
+    )
+    fake_pg = MagicMock(name="pg")
+
+    with (
+        patch("torchspec.ray.placement_group._ensure_ray_initialized"),
+        patch("torchspec.ray.placement_group._wait_for_gpu_resources") as wait_for_gpus,
+        patch(
+            "torchspec.ray.placement_group._create_placement_group",
+            return_value=(fake_pg, [0, 1], [0, 1]),
+        ) as create_pg,
+    ):
+        result = create_placement_groups(args, roles={"training"})
+
+    wait_for_gpus.assert_called_once_with(2)
+    create_pg.assert_called_once_with(2, strategy="PACK", name="training_pg")
+    assert result["training"] == (fake_pg, [0, 1], [0, 1])
+    assert result["inference"] == (fake_pg, [], [])
+
+
+def test_single_role_placement_rejects_custom_strategy():
+    args = _make_args(
+        inference_engine_type="offline",
+        placement_strategy="custom",
+        training_node_ips=["10.0.0.1"],
+    )
+
+    with (
+        patch("torchspec.ray.placement_group._ensure_ray_initialized"),
+        patch("torchspec.ray.placement_group._wait_for_gpu_resources") as wait_for_gpus,
+        pytest.raises(ValueError, match="only supported when training and inference"),
+    ):
+        create_placement_groups(args, roles={"training"})
+
+    wait_for_gpus.assert_not_called()

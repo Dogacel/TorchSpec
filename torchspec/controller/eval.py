@@ -180,8 +180,13 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
 
     if eval_enabled:
         cache_dir = os.path.abspath(getattr(args, "cache_dir", "./cache"))
+        data_source = (
+            getattr(args, "offline_data_path", "")
+            if getattr(args, "inference_engine_type", None) == "offline"
+            else getattr(args, "eval_data_path", "")
+        )
         cache_key = hashlib.md5(
-            f"{getattr(args, 'eval_data_path', '')}|"
+            f"{data_source}|"
             f"{getattr(args, 'target_model_path', '')}|"
             f"{getattr(args, 'max_seq_length', 0)}".encode()
         ).hexdigest()[:12]

@@ -35,14 +35,16 @@ python -m torchspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `training` | `learning_rate`, `micro_batch_size`, `ttt_length` | Training hyperparameters |
 | `inference` | `inference_engine_type`, `inference_num_gpus` | Inference backend configuration |
 | `inference.sglang` | `tp_size`, `mem_fraction_static`, `extra_args` | SGLang engine settings (nested under inference) |
+| `inference.offline` | `data_path`, `num_engines` | Offline training settings selected by `inference_engine_type: offline` |
 | `mooncake` | `protocol`, `device_name` | Mooncake transfer engine settings |
 
-## Custom Ray placement
+## Custom online Ray placement
 
 Use `training.placement_strategy: custom` when training and inference must run
 on explicitly chosen Ray nodes. This is useful when the default `PACK` placement
 would put actors on nodes with the wrong network locality, cache state, or GPU
-partition.
+partition. Offline training and materialization are single-role workflows and
+use plain `PACK` placement.
 
 IP-based placement uses Ray's built-in `node:<ip>` resource and does not require
 custom Ray labels:

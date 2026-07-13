@@ -31,17 +31,20 @@ torchspec/controller/
 
 ## Placement Groups
 
-Placement groups reserve GPUs for training and inference as a unit and place them on the correct nodes. `create_placement_groups(args)` is the single entry point.
+Placement groups reserve GPUs and place them on the correct nodes.
+`create_placement_groups(args, roles=...)` is the single entry point. Online
+training requests both roles, offline training defaults to training only, and
+the materialization command requests inference only.
 
 | Mode | Training GPUs | Inference GPUs | Use case |
 |------|--------------|----------------|----------|
 | Default | Sliced from unified PG | Sliced from unified PG | Production: deterministic node-to-role assignment |
-| `custom` | Sliced from custom unified PG | Sliced from custom unified PG | Production: explicit node choice with the same unified reservation semantics |
+| Online `custom` | Sliced from custom unified PG | Sliced from custom unified PG | Production: explicit node choice with the same unified reservation semantics |
 | `colocate` | Shared PG | Shared PG | Dev: share GPUs between train & inference |
-| `debug_train_only` | Dedicated PG | Empty | Debug training without inference |
-| `debug_inference_only` | Empty | Dedicated PG | Debug inference without training |
+| Offline training | Dedicated PG | None | Train from materialized target outputs |
+| Materialization | None | Dedicated PG | Produce target outputs for offline training |
 
-Each placement group probes bundles with a temporary `InfoActor` to discover the actual (node IP, GPU ID) mapping, then sorts by (node, GPU ID) for deterministic ordering. In `custom` mode, TorchSpec sorts by the configured node order first and by physical GPU ID within each selected node.
+Each placement group probes bundles with a temporary `InfoActor` to discover the actual (node IP, GPU ID) mapping, then sorts by (node, GPU ID) for deterministic ordering. `placement_strategy` applies only when online training creates both roles; single-role workflows use `PACK` placement.
 
 ## Ray Cluster Setup
 
@@ -135,7 +138,7 @@ The PACK placement strategy spreads them across nodes automatically.
 | `training.training_num_nodes` | 1 | Number of training nodes |
 | `training.training_num_gpus_per_node` | 1 | GPUs per training node |
 
-### Custom node placement
+### Custom online node placement
 
 By default, TorchSpec creates a unified placement group with Ray's `PACK`
 strategy, probes the resulting bundles, and assigns the ordered bundles to

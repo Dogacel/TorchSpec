@@ -53,6 +53,7 @@ class TrainSample:
     packed_loss_mask: Optional[str] = None
     last_turn_loss_only: Optional[bool] = None
     metadata: Optional[Dict[str, Any]] = None
+    data_id: Optional[str] = None
 
 
 class MooncakeDataset(IterableDataset):

@@ -86,6 +86,13 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             self._async_put_manager.check_last_error()
             self._async_put_manager.wait_for_buffer(buf.ptr)
 
+            # Offline replay tensors are already on the host, so CUDA event and
+            # stream synchronization is both unnecessary and unavailable.
+            if not any(tensor.is_cuda for tensor in tensors):
+                buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+                self._async_put_manager.submit(keys, buffer_ptrs, sizes, buf.ptr)
+                return
+
             compute_event = torch.cuda.Event()
             compute_event.record()
 

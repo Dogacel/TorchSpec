@@ -21,10 +21,12 @@
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.inference.engine.hf_engine import HFEngine
+from torchspec.inference.engine.offline_replay_engine import OfflineReplayEngine
 
 __all__ = [
     "InferenceEngine",
     "HFEngine",
+    "OfflineReplayEngine",
 ]
 
 try:

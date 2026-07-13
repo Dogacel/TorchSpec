@@ -48,8 +48,6 @@ class DatasetConfig:
 
 @dataclass
 class DebugConfig:
-    debug_inference_only: bool = False
-    debug_train_only: bool = False
     enable_perf_metrics: bool = True
     max_dump_steps: int = 5
     memory_recorder: str = "torch"
@@ -202,7 +200,12 @@ class Config:
     output_dir: str = ""
 
 
-_ALWAYS_LOCAL_PATH_KEYS = ("output_dir", "cache_dir", "model_download_dir")
+_ALWAYS_LOCAL_PATH_KEYS = (
+    "output_dir",
+    "cache_dir",
+    "model_download_dir",
+    "inference.offline.data_path",
+)
 _DATA_PATH_KEYS = ("dataset.train_data_path", "dataset.eval_data_path")
 
 
@@ -251,6 +254,21 @@ def _validate_vllm_config(config: DictConfig) -> None:
             raise NotImplementedError(f"{label} is not yet supported with the vllm backend!")
 
 
+def _validate_offline_config(config: DictConfig) -> None:
+    if config.inference.inference_engine_type == "offline":
+        if not config.inference.offline.data_path:
+            raise ValueError(
+                "inference.offline.data_path is required when "
+                "inference.inference_engine_type=offline"
+            )
+        if config.training.train_with_decode:
+            raise ValueError("training.train_with_decode is not supported in offline mode")
+        if config.training.attention_backend == "usp":
+            raise ValueError("training.attention_backend=usp is not supported offline")
+        if config.inference.offline.num_engines <= 0:
+            raise ValueError("inference.offline.num_engines must be positive")
+
+
 def _save_config_snapshot(config: DictConfig) -> None:
     """Save the resolved config to output_dir/config.yaml if output_dir is set."""
     output_dir = OmegaConf.select(config, "output_dir", default=None)
@@ -295,6 +313,7 @@ def load_config(
     _resolve_relative_paths(config, os.getcwd())
 
     _validate_vllm_config(config)
+    _validate_offline_config(config)
 
     if save_snapshot:
         _save_config_snapshot(config)
@@ -306,6 +325,7 @@ def load_config(
 _PREFIXED_SECTIONS = {
     "decode": "decode_",
     "mooncake": "mooncake_",
+    "offline": "offline_",
     "sglang": "sglang_",
     "vllm": "vllm_",
     "trtllm": "trtllm_",
@@ -343,6 +363,9 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     # --- Computed / alias fields ---
     flat["world_size"] = flat["training_num_nodes"] * flat["training_num_gpus_per_node"]
     flat["rank"] = 0
+    if flat.get("inference_engine_type") == "offline":
+        # Replay records are already tokenized and carry their loss masks.
+        flat["defer_tokenization"] = False
     flat["dynamic_loss_mask"] = flat["defer_tokenization"] and not flat["train_with_decode"]
     flat["use_wandb"] = flat.get("use_wandb", False) or flat.get("report_to") == "wandb"
     flat["use_tensorboard"] = (
@@ -354,7 +377,9 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     if flat.get("continual_training") and not flat.get("load_path"):
         logger.warning("continual_training=True but no training.load_path was provided")
 
-    if "last_hidden_states_prenorm" not in flat or flat["last_hidden_states_prenorm"] is None:
+    if (
+        "last_hidden_states_prenorm" not in flat or flat["last_hidden_states_prenorm"] is None
+    ) and flat.get("inference_engine_type") != "offline":
         flat["last_hidden_states_prenorm"] = flat.get("inference_engine_type") == "vllm"
 
     return argparse.Namespace(**flat)

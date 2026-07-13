@@ -118,7 +118,8 @@ class MooncakeHiddenStateStore(ABC):
         if self.config.enable_gpu_direct and torch.cuda.is_available():
             self._setup_gpu_direct(device)
 
-        if torch.cuda.is_available():
+        # Can't create copy stream for "cpu" device (offline replay engine).
+        if torch.cuda.is_available() and (device is None or device.type == "cuda"):
             cuda_device = device if device is not None else torch.device("cuda")
             self._copy_stream = torch.cuda.Stream(device=cuda_device)
             logger.info("DtoH copy stream created on %s", cuda_device)

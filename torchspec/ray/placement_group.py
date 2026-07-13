@@ -322,11 +322,7 @@ def _ensure_ray_initialized():
 def _get_expected_gpu_count(args) -> int:
     training_gpus = args.training_num_nodes * args.training_num_gpus_per_node
     inference_gpus = getattr(args, "inference_num_gpus", 0)
-    if (
-        getattr(args, "colocate", False)
-        or getattr(args, "debug_train_only", False)
-        or getattr(args, "debug_inference_only", False)
-    ):
+    if getattr(args, "colocate", False):
         return max(training_gpus, inference_gpus)
     return training_gpus + inference_gpus
 
@@ -352,55 +348,6 @@ def _wait_for_gpu_resources(expected_gpus: int, timeout: int = 300, poll_interva
         f"Timed out waiting for GPUs: {available}/{expected_gpus} after {timeout}s. "
         f"Check that all Ray worker nodes have joined the cluster."
     )
-
-
-def _create_custom_role_placement_group(
-    args,
-    role: str,
-    *,
-    total_gpus: int,
-    gpus_per_node: int,
-    name: str,
-):
-    constraints = _normalize_node_constraints(args, role, required=True)
-    bundles, bundle_label_selectors, node_group_indices = _build_custom_bundles(
-        role,
-        constraints,
-        total_gpus,
-        gpus_per_node,
-    )
-    logger.info(
-        f"Creating custom {role} placement group with {total_gpus} GPU(s) on "
-        f"{[constraint.selector_for_log for constraint in constraints]}"
-    )
-    return _create_placement_group(
-        total_gpus,
-        strategy="PACK",
-        name=name,
-        bundles=bundles,
-        bundle_label_selector=_merge_bundle_label_selectors(bundle_label_selectors),
-        node_group_indices=node_group_indices,
-    )
-
-
-def _create_role_placement_group(
-    args,
-    role: str,
-    *,
-    total_gpus: int,
-    gpus_per_node: int,
-    name: str,
-    custom: bool,
-):
-    if custom:
-        return _create_custom_role_placement_group(
-            args,
-            role,
-            total_gpus=total_gpus,
-            gpus_per_node=gpus_per_node,
-            name=f"custom_{name}",
-        )
-    return _create_placement_group(total_gpus, strategy="PACK", name=name)
 
 
 def _create_custom_unified_placement_group(args, num_training_gpus: int, num_inference_gpus: int):
@@ -497,32 +444,6 @@ def _validate_custom_placement_constraints(args) -> None:
     if getattr(args, "placement_strategy", "training_first") != "custom":
         return
 
-    if args.debug_train_only:
-        num_training_gpus = args.training_num_nodes * args.training_num_gpus_per_node
-        training_constraints = _normalize_node_constraints(
-            args, "training", required=num_training_gpus > 0
-        )
-        _build_custom_bundles(
-            "training",
-            training_constraints,
-            num_training_gpus,
-            args.training_num_gpus_per_node,
-        )
-        return
-
-    if args.debug_inference_only:
-        num_inference_gpus = args.inference_num_gpus
-        inference_constraints = _normalize_node_constraints(
-            args, "inference", required=num_inference_gpus > 0
-        )
-        _build_custom_bundles(
-            "inference",
-            inference_constraints,
-            num_inference_gpus,
-            args.inference_num_gpus_per_node,
-        )
-        return
-
     if args.colocate:
         num_gpus = args.training_num_nodes * args.training_num_gpus_per_node
         _role, constraints = _get_custom_colocated_constraints(args)
@@ -584,48 +505,48 @@ def _create_custom_colocated_placement_group(args, num_gpus: int):
     )
 
 
-def create_placement_groups(args):
-    """Initialize Ray, wait for GPU resources, and create placement groups.
+def create_placement_groups(args, roles: set[str] | None = None):
+    """Create placement groups for the requested training/inference roles."""
+    if roles is None:
+        roles = {"training", "inference"}
+    roles = frozenset(roles)
+    unknown = roles - {"training", "inference"}
+    if not roles or unknown:
+        raise ValueError(f"Invalid placement roles: {sorted(roles)}")
 
-    This is the single entry point for all GPU placement setup.
-    """
     _ensure_ray_initialized()
+
+    if len(roles) == 1:
+        if getattr(
+            args, "placement_strategy", "training_first"
+        ) == "custom" or _has_custom_placement_fields(args):
+            raise ValueError(
+                "Custom placement is only supported when training and inference "
+                "roles are created together"
+            )
+
+        role = next(iter(roles))
+        if role == "training":
+            num_gpus = args.training_num_nodes * args.training_num_gpus_per_node
+        else:
+            num_gpus = args.inference_num_gpus
+        if not isinstance(num_gpus, int) or num_gpus <= 0:
+            raise ValueError(f"{role.capitalize()} placement requires a positive GPU count")
+
+        _wait_for_gpu_resources(num_gpus)
+        logger.info("Creating %s-only placement with %d GPUs...", role, num_gpus)
+        pg, bundle_indices, gpu_ids = _create_placement_group(
+            num_gpus, strategy="PACK", name=f"{role}_pg"
+        )
+        empty = (pg, [], [])
+        result = {"training": empty, "inference": empty}
+        result[role] = (pg, bundle_indices, gpu_ids)
+        return result
+
     _validate_custom_strategy_usage(args)
     _validate_custom_placement_constraints(args)
     _wait_for_gpu_resources(_get_expected_gpu_count(args))
     placement_strategy = getattr(args, "placement_strategy", "training_first")
-
-    if args.debug_train_only:
-        num_training_gpus = args.training_num_nodes * args.training_num_gpus_per_node
-        logger.info(f"Creating training placement group with {num_training_gpus} GPUs...")
-        training_pg, training_bundle_indices, training_gpu_ids = _create_role_placement_group(
-            args,
-            "training",
-            total_gpus=num_training_gpus,
-            gpus_per_node=args.training_num_gpus_per_node,
-            name="training_pg",
-            custom=placement_strategy == "custom",
-        )
-        return {
-            "training": (training_pg, training_bundle_indices, training_gpu_ids),
-            "inference": (training_pg, [], []),
-        }
-
-    if args.debug_inference_only:
-        num_inference_gpus = args.inference_num_gpus
-        logger.info(f"Creating inference placement group with {num_inference_gpus} GPUs...")
-        inference_pg, inference_bundle_indices, inference_gpu_ids = _create_role_placement_group(
-            args,
-            "inference",
-            total_gpus=num_inference_gpus,
-            gpus_per_node=args.inference_num_gpus_per_node,
-            name="inference_pg",
-            custom=placement_strategy == "custom",
-        )
-        return {
-            "training": (inference_pg, [], []),
-            "inference": (inference_pg, inference_bundle_indices, inference_gpu_ids),
-        }
 
     if args.colocate:
         num_gpus = args.training_num_nodes * args.training_num_gpus_per_node

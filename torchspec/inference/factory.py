@@ -34,13 +34,17 @@ _alive_worker_engines: list = []
 def create_inference_engines(args, inference_pg, mooncake_config, engine_group: int = 0):
     """Create inference engines based on configured engine type (blocking).
 
-    Supports "hf", "sgl", and "vllm" engine types via inference_engine_type config.
+    Supports live inference engines and the CPU-only ``offline`` replay engine.
 
     Returns:
         List of head engines used for dispatching requests. Multi-node TP
         worker engines (if any) are kept alive internally but not returned.
     """
     engine_type = getattr(args, "inference_engine_type", "hf")
+    if engine_type == "offline":
+        engines, init_refs = _prepare_offline_replay_engines(args, mooncake_config, engine_group)
+        _wait_for_init(init_refs, "OfflineReplay", timeout=300)
+        return engines
 
     if engine_type not in ("hf", "sgl", "vllm", "trtllm"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
@@ -73,6 +77,8 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
         for dispatching requests, and init_refs are ObjectRefs to wait on.
     """
     engine_type = getattr(args, "inference_engine_type", "hf")
+    if engine_type == "offline":
+        return _prepare_offline_replay_engines(args, mooncake_config, engine_group)
 
     if engine_type not in ("hf", "sgl", "vllm", "trtllm"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
@@ -92,6 +98,30 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
             args, inference_pg, mooncake_config, engine_group
         )
 
+    return engines, init_refs
+
+
+def _prepare_offline_replay_engines(
+    args, mooncake_config, engine_group: int = 0
+) -> tuple[list, list]:
+    """Create CPU replay actors; they do not consume inference placement GPUs."""
+    from torchspec.inference.engine.offline_replay_engine import OfflineReplayEngine
+
+    num_engines = getattr(args, "offline_num_engines", 1)
+    if num_engines <= 0:
+        raise ValueError("inference.offline.num_engines must be positive")
+    ReplayRayActor = ray.remote(OfflineReplayEngine)
+    env_vars = get_torchspec_env_vars()
+    engines = [
+        ReplayRayActor.options(
+            num_cpus=1,
+            num_gpus=0,
+            runtime_env={"env_vars": env_vars},
+        ).remote(args=args, rank=rank, engine_group=engine_group)
+        for rank in range(num_engines)
+    ]
+    init_refs = [engine.init.remote(mooncake_config=mooncake_config) for engine in engines]
+    logger.info("Preparing %d CPU offline replay engine(s)", num_engines)
     return engines, init_refs
 
 

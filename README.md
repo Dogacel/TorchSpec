@@ -161,6 +161,11 @@ See [examples/README.md](examples/README.md) for more details about each example
 
 ## Training Modes
 
+### Offline Replay Training
+
+Offline replay ([Docs](docs/offline_training.md)) is a training mode that separates target-output generation from draft-model training by reading hidden states from disk. Recommended for testing and development on 1 GPU.
+
+
 ### Resume vs. Continual Training
 
 Both modes use `training.load_path`, but they restore different states:

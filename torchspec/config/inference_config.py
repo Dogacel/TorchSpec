@@ -134,6 +134,14 @@ class TrtllmConfig:
 
 
 @dataclass
+class OfflineTrainingConfig:
+    """Configuration for training from materialized target outputs."""
+
+    data_path: Optional[str] = None
+    num_engines: int = 1
+
+
+@dataclass
 class InferenceConfig:
     aux_hidden_states_layers: Optional[list] = None
     inference_batch_size: int = 1
@@ -148,6 +156,7 @@ class InferenceConfig:
     last_hidden_states_prenorm: Optional[bool] = None
     max_sample_pool_size: int = 0
     store_last_hidden_states: bool = True
+    offline: OfflineTrainingConfig = field(default_factory=OfflineTrainingConfig)
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
     vllm: VllmConfig = field(default_factory=VllmConfig)
     trtllm: TrtllmConfig = field(default_factory=TrtllmConfig)

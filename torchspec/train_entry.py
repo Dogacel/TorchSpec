@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from typing import Any, Generator
 
 import ray
+import torch
 from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -110,7 +111,7 @@ def parse_config():
     model, dataset, training, debug, inference, logging, mooncake, decode.
 
     The config is flattened via config_to_flat_args(), with prefixed sections:
-    mooncake_*, sglang_*, decode_*.
+    mooncake_*, sglang_*, offline_*, decode_*.
     """
 
     parser = argparse.ArgumentParser(description="Eagle3 speculative decoding training")
@@ -137,8 +138,6 @@ def parse_config():
 
     defaults = {
         "colocate": False,
-        "debug_train_only": False,
-        "debug_inference_only": False,
         "dp_size": None,
         "save_debug_train_data": None,
     }
@@ -148,6 +147,21 @@ def parse_config():
 
     _resolve_batch_size(flat_args)
     _validate_usp_args(flat_args)
+
+    if (
+        getattr(flat_args, "inference_engine_type", None) == "offline"
+        and getattr(flat_args, "max_sample_pool_size", 0) <= 0
+    ):
+        flat_args.max_sample_pool_size = max(
+            flat_args.global_batch_size,
+            getattr(flat_args, "inference_batch_size", 1)
+            * getattr(flat_args, "offline_num_engines", 1)
+            * 2,
+        )
+        logger.info(
+            "Offline replay set max_sample_pool_size=%d for bounded Mooncake staging",
+            flat_args.max_sample_pool_size,
+        )
 
     return flat_args
 
@@ -261,9 +275,10 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
     algo = "DSpark" if is_dspark else "DFlash"
 
     engine_type = getattr(args, "inference_engine_type", "hf")
-    if engine_type not in ("vllm", "sgl", "trtllm"):
+    if engine_type not in ("vllm", "sgl", "trtllm", "offline"):
         raise NotImplementedError(
-            f"{algo} supports inference_engine_type in ('vllm', 'sgl', 'trtllm'), got '{engine_type}'."
+            f"{algo} supports inference_engine_type in "
+            f"('vllm', 'sgl', 'trtllm', 'offline'), got '{engine_type}'."
         )
     if getattr(args, "defer_tokenization", False):
         raise NotImplementedError("DFlash does not support defer_tokenization=True.")
@@ -289,7 +304,7 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
 
 
 def train_async_no_generation(args):
-    """Entry point for Eagle3 online training.
+    """Entry point for Eagle3 asynchronous training.
 
     Supports prefill-only mode (default) and decode mode (train_with_decode=True)
     with speculative decoding. Uses distributed Ray actors with placement groups.
@@ -300,6 +315,15 @@ def train_async_no_generation(args):
         and getattr(args, "inference_engine_type", "sgl") != "sgl"
     ):
         raise ValueError("train_with_decode=True requires inference_engine_type=sgl")
+
+    if getattr(args, "inference_engine_type", None) == "offline":
+        from torchspec.offline.dataset import (
+            OfflineDataset,
+            configure_offline_args,
+        )
+
+        offline_dataset = OfflineDataset(args.offline_data_path)
+        configure_offline_args(offline_dataset, args)
 
     init_tracking(args)
     timer = _InitTimer()
@@ -326,7 +350,12 @@ def train_async_no_generation(args):
 
     # [3] Do initialization that doesn't depend on dataset in parallel
     with timer.phase("Driver-side init"):
-        pgs = create_placement_groups(args)
+        roles = (
+            {"training"}
+            if getattr(args, "inference_engine_type", None) == "offline"
+            else {"training", "inference"}
+        )
+        pgs = create_placement_groups(args, roles=roles)
         launch_mooncake_master(args)
         mooncake_config = build_mooncake_config(args)
 
@@ -346,13 +375,23 @@ def train_async_no_generation(args):
     vocab_size = draft_model_config.vocab_size
     if draft_vocab_size is not None and draft_vocab_size != vocab_size:
         with timer.phase("Vocab mapping"):
-            logger.info(
-                f"Computing vocab mapping on controller "
-                f"(target={vocab_size}, draft={draft_vocab_size})..."
-            )
-            vocab_mapping = ray.get(
-                controller.compute_vocab_mapping.remote(vocab_size, draft_vocab_size)
-            )
+            if getattr(args, "inference_engine_type", None) == "offline":
+                mapping_path = os.path.join(args.offline_data_path, "vocab_mapping.pt")
+                if not os.path.isfile(mapping_path):
+                    raise FileNotFoundError(
+                        "Offline replay requires the vocabulary mapping produced during "
+                        f"materialization: {mapping_path}"
+                    )
+                saved_mapping = torch.load(mapping_path, map_location="cpu", weights_only=True)
+                vocab_mapping = (saved_mapping["d2t"], saved_mapping["t2d"])
+            else:
+                logger.info(
+                    f"Computing vocab mapping on controller "
+                    f"(target={vocab_size}, draft={draft_vocab_size})..."
+                )
+                vocab_mapping = ray.get(
+                    controller.compute_vocab_mapping.remote(vocab_size, draft_vocab_size)
+                )
             logger.info(
                 f"Generated vocab mapping: "
                 f"d2t={vocab_mapping[0].shape}, t2d={vocab_mapping[1].shape}"

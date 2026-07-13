@@ -204,12 +204,42 @@ class AsyncTrainingController:
                 self.prompt_buffer.append(entry)
             return len(dataset)
 
-    def load_dataset(self, args) -> int:
-        """Load and store dataset on the controller for later use."""
+    def _load_dataset_split(self, args, split: str) -> list:
+        """Load one split from either replay records or conversation data."""
+        if split not in ("train", "eval"):
+            raise ValueError(f"Unknown dataset split: {split!r}")
+
+        if getattr(args, "inference_engine_type", None) == "offline":
+            from torchspec.offline.dataset import OfflineDataset
+
+            dataset = OfflineDataset(args.offline_data_path)
+            return [
+                {"data_id": str(row["data_id"]), "metadata": {"offline_replay": True}}
+                for row in dataset.rows(split)
+            ]
+
+        data_path = (
+            args.train_data_path if split == "train" else getattr(args, "eval_data_path", None)
+        )
+        if not data_path:
+            return []
+
         from torchspec.data.dataset import load_conversation_dataset
 
-        self._stored_dataset = load_conversation_dataset(args)
+        dataset_args = args
+        if split == "eval":
+            dataset_args = copy.copy(args)
+            dataset_args.train_data_path = data_path
+            if getattr(args, "eval_prompt_key", None):
+                dataset_args.prompt_key = args.eval_prompt_key
+        return load_conversation_dataset(dataset_args)
+
+    def load_dataset(self, args) -> int:
+        """Load and store the training dataset for later epochs."""
+        self._stored_dataset = self._load_dataset_split(args, "train")
         if not self._stored_dataset:
+            if getattr(args, "inference_engine_type", None) == "offline":
+                raise ValueError("Offline dataset has no train samples")
             raise ValueError(
                 f"Training dataset is empty after processing. "
                 f"Check train_data_path='{args.train_data_path}', "
@@ -269,18 +299,7 @@ class AsyncTrainingController:
 
     def load_eval_dataset(self, args) -> int:
         """Load eval dataset on the controller and store it. Returns size (0 if none)."""
-        eval_data_path = getattr(args, "eval_data_path", None)
-        if not eval_data_path:
-            return 0
-
-        from torchspec.data.dataset import load_conversation_dataset
-
-        eval_args = copy.copy(args)
-        eval_args.train_data_path = eval_data_path
-        eval_prompt_key = getattr(args, "eval_prompt_key", None)
-        if eval_prompt_key:
-            eval_args.prompt_key = eval_prompt_key
-        raw_dataset = load_conversation_dataset(eval_args)
+        raw_dataset = self._load_dataset_split(args, "eval")
         raw_count = len(raw_dataset)
         # Truncate to a multiple of dp_size so every dispatch is a full batch
         usable = (raw_count // self.dp_size) * self.dp_size
@@ -289,9 +308,9 @@ class AsyncTrainingController:
                 f"Eval dataset truncated from {raw_count} to {usable} samples "
                 f"(dp_size={self.dp_size})"
             )
-        self._stored_eval_dataset = raw_dataset[:usable] if usable > 0 else []
+        self._stored_eval_dataset = raw_dataset[:usable]
         count = len(self._stored_eval_dataset)
-        logger.info(f"Controller loaded eval dataset: {count} samples from {eval_data_path}")
+        logger.info(f"Controller loaded eval dataset: {count} samples")
         return count
 
     def get_dataset_size(self) -> int:
@@ -524,6 +543,7 @@ class AsyncTrainingController:
                     packed_loss_mask=result.packed_loss_mask,
                     last_turn_loss_only=last_turn_loss_only,
                     metadata=metadata,
+                    data_id=result.data_id,
                 )
                 if self.sp_size > 1 and len(queues) == self.queue_count:
                     start = dp_rank * self.sp_size
@@ -555,7 +575,11 @@ class AsyncTrainingController:
         for sample in dataset:
             if isinstance(sample, dict):
                 raw_id = sample.get("data_id") or self._generate_data_id()
-                data_id = f"eval_{raw_id}"
+                data_id = (
+                    str(raw_id)
+                    if getattr(self.args, "inference_engine_type", None) == "offline"
+                    else f"eval_{raw_id}"
+                )
                 self._eval_data_ids.add(data_id)
                 entry = InferenceInput(
                     data_id=data_id,

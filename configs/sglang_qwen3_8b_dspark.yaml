@@ -85,5 +85,3 @@ model_download_dir: null
 
 debug:
   save_debug_train_data: null
-  debug_train_only: false
-  debug_inference_only: false
