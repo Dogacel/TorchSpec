@@ -155,8 +155,27 @@ class TrainingConfig:
     dflash_l1_loss_alpha: float = 0.0
     dflash_num_anchors: int = 512
     dflash_num_target_layers: int = 5
+    # ReMDM-style self-conditioning / remask sampling (all default-off):
+    # fraction of training blocks whose most-confident dry-run predictions are
+    # revealed as inputs; max keep-fraction per revealed block; eval-time
+    # two-pass remask keep-fraction (0 disables the second eval pass).
+    dflash_self_cond_frac: float = 0.0
+    dflash_self_cond_keep_max: float = 0.75
+    dflash_remask_eval_keep: float = 0.0
+    # Schedule-matched self-conditioning (v6.1): 2 dry rounds trains
+    # late-schedule states on refined beliefs; round-2 blocks draw reveal
+    # fractions from [round2_keep_min, keep_max]; random_frac of blocks
+    # reveal a random subset instead of top-confidence (exploration).
+    dflash_self_cond_rounds: int = 1
+    dflash_self_cond_round2_keep_min: float = 0.4
+    dflash_self_cond_random_frac: float = 0.0
 
     # DSpark-specific parameters (used by DSpark trainer only)
+    flowspec_ce_alpha: float = 0.2
+    flowspec_fc_init_path: Optional[str] = None
+    flowspec_chunk_ae_path: Optional[str] = None
+    flowspec_l1_alpha: float = 0.0
+
     dspark_num_anchors: int = 512
     dspark_num_target_layers: int = 5
     dspark_loss_decay_gamma: float = 4.0

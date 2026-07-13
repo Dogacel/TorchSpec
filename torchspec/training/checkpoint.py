@@ -29,6 +29,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
@@ -147,18 +148,31 @@ def load(actor: Any) -> dict[str, Any] | None:
         logger.info(f"Model checkpoint {model_dir} not found; skipping load.")
         return None
 
-    # Load model weights (always)
+    continual_training = getattr(actor.args, "continual_training", False)
+
+    # Load model weights (always). For continual training (warm start) the loaded
+    # checkpoint may predate newly-added modules (e.g. a norm added to the draft),
+    # so use a partial-tolerant planner: model params absent from the checkpoint
+    # keep their fresh init instead of aborting the whole load. This only relaxes
+    # *missing-key* strictness — present keys are still shape/dtype-checked, so a
+    # genuinely wrong/corrupt checkpoint still fails. Full resumes stay strict.
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}
+    load_planner = DefaultLoadPlanner(allow_partial_load=True) if continual_training else None
 
     try:
-        dcp.load(state_dict=state_dict, checkpoint_id=str(model_dir))
-        logger.info(f"Loaded model from {model_dir}")
+        dcp.load(state_dict=state_dict, checkpoint_id=str(model_dir), planner=load_planner)
+        logger.info(
+            f"Loaded model from {model_dir}"
+            + (
+                " (continual: partial load, missing keys kept at init)"
+                if continual_training
+                else ""
+            )
+        )
     except Exception as e:
         logger.error(f"Failed to load model from {model_dir}: {e}")
         return None
-
-    continual_training = getattr(actor.args, "continual_training", False)
 
     # Keep optimizer/LR state out of continual training so it starts fresh.
     load_optimizer = not continual_training and hasattr(actor, "optimizer")

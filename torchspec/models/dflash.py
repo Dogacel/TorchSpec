@@ -26,6 +26,7 @@ and cross-entropy loss with exponential decay weighting.
 Matches SpecForge's OnlineDFlashModel (specforge/core/dflash.py).
 """
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -111,6 +112,12 @@ class DFlashModel(nn.Module):
         loss_decay_gamma: float = 7.0,
         ce_loss_alpha: float = 1.0,
         l1_loss_alpha: float = 0.0,
+        self_cond_frac: float = 0.0,
+        self_cond_keep_max: float = 0.75,
+        remask_eval_keep: float = 0.0,
+        self_cond_rounds: int = 1,
+        self_cond_round2_keep_min: float = 0.4,
+        self_cond_random_frac: float = 0.0,
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -121,6 +128,14 @@ class DFlashModel(nn.Module):
             )
         if not 0.0 <= dpace_alpha <= 1.0:
             raise ValueError(f"dflash_dpace_alpha must be in [0, 1], got {dpace_alpha}")
+        if not 0.0 <= self_cond_frac <= 1.0:
+            raise ValueError(f"dflash_self_cond_frac must be in [0, 1], got {self_cond_frac}")
+        if not 0.0 <= self_cond_keep_max < 1.0:
+            raise ValueError(
+                f"dflash_self_cond_keep_max must be in [0, 1), got {self_cond_keep_max}"
+            )
+        if not 0.0 <= remask_eval_keep < 1.0:
+            raise ValueError(f"dflash_remask_eval_keep must be in [0, 1), got {remask_eval_keep}")
 
         self.draft_model = draft_model
         self.block_size = block_size
@@ -130,6 +145,18 @@ class DFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
+        self.self_cond_frac = float(self_cond_frac)
+        self.self_cond_keep_max = float(self_cond_keep_max)
+        self.remask_eval_keep = float(remask_eval_keep)
+        if self_cond_rounds not in (1, 2):
+            raise ValueError(f"dflash_self_cond_rounds must be 1 or 2, got {self_cond_rounds}")
+        if not 0.0 <= self_cond_random_frac <= 1.0:
+            raise ValueError(
+                f"dflash_self_cond_random_frac must be in [0, 1], got {self_cond_random_frac}"
+            )
+        self.self_cond_rounds = int(self_cond_rounds)
+        self.self_cond_round2_keep_min = float(self_cond_round2_keep_min)
+        self.self_cond_random_frac = float(self_cond_random_frac)
 
     def _sample_anchor_positions(
         self,
@@ -209,16 +236,13 @@ class DFlashModel(nn.Module):
 
         return context_position_ids, draft_position_ids
 
-    def _create_noise_embed(
+    def _create_noise_ids(
         self,
         input_ids: torch.Tensor,
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Create noise embeddings: anchor token at block starts, MASK elsewhere.
-
-        Matches SpecForge's OnlineDFlashModel._create_noise_embed().
-        """
+        """Create noise token ids: anchor token at block starts, MASK elsewhere."""
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
         bs = self.block_size
@@ -241,27 +265,34 @@ class DFlashModel(nn.Module):
             torch.tensor(self.draft_model.mask_token_id, dtype=torch.long, device=device),
         )
 
+        return noise_ids
+
+    def _create_noise_embed(
+        self,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Create noise embeddings: anchor token at block starts, MASK elsewhere.
+
+        Matches SpecForge's OnlineDFlashModel._create_noise_embed().
+        """
+        noise_ids = self._create_noise_ids(input_ids, anchor_positions, block_keep_mask)
         return self.draft_model.embed_tokens(noise_ids)
 
-    def _draft_backbone(
+    def _prepare_draft_inputs(
         self,
         input_ids: torch.Tensor,
         hidden_states_list: List[torch.Tensor],
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """
-        Shared DFlash backbone (context features → anchor sampling → noise
-        embedding → position ids → block-causal mask → draft model forward).
+    ) -> dict:
+        """Build everything a draft forward needs except the block content.
 
-        Both ``DFlashModel.forward`` and ``DSparkModel.forward`` build the draft
-        hidden states this exact way; only the label/loss tail differs. Keeping
-        the attention/mask/anchor wiring here gives it a single source of truth.
-
-        Returns:
-            draft_hidden: [B, n_blocks*block_size, D] pre-loss draft hidden states
-            anchor_positions: [B, n_blocks] sampled anchor positions
-            block_keep_mask: [B, n_blocks] bool validity of each anchor slot
-            n_blocks: number of anchor slots (== num_anchors)
+        Steps 1-5 of the backbone (context features → anchor sampling → noise
+        ids/embedding → position ids → block-causal mask). The attention mask
+        depends only on anchors/validity/positions — never on block content —
+        so one prepared bundle can serve several forward passes with different
+        block fillings (all-MASK, self-conditioned, remasked).
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -275,8 +306,8 @@ class DFlashModel(nn.Module):
         )
         n_blocks = anchor_positions.shape[1]
 
-        # 3. Create noise embeddings (anchor token + MASK tokens)
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
+        # 3. Create noise token ids (anchor token + MASK tokens)
+        noise_ids = self._create_noise_ids(input_ids, anchor_positions, block_keep_mask)
 
         # 4. Create position IDs
         context_position_ids, draft_position_ids = self._create_position_ids(
@@ -304,17 +335,200 @@ class DFlashModel(nn.Module):
                 device=device,
             )
 
-        # 6. Draft model forward — pass embeddings directly
-        draft_hidden = self.draft_model(
+        return {
+            "context_feature": context_feature,
+            "anchor_positions": anchor_positions,
+            "block_keep_mask": block_keep_mask,
+            "noise_ids": noise_ids,
+            "context_position_ids": context_position_ids,
+            "draft_position_ids": draft_position_ids,
+            "block_mask": block_mask,
+            "n_blocks": n_blocks,
+        }
+
+    def _run_draft(self, prep: dict, noise_ids: torch.Tensor) -> torch.Tensor:
+        """Step 6 of the backbone: one draft forward over prepared inputs."""
+        noise_embedding = self.draft_model.embed_tokens(noise_ids)
+        return self.draft_model(
             draft_input_ids=None,
-            context_feature=context_feature,
-            draft_position_ids=draft_position_ids,
-            context_position_ids=context_position_ids,
-            block_mask=block_mask,
+            context_feature=prep["context_feature"],
+            draft_position_ids=prep["draft_position_ids"],
+            context_position_ids=prep["context_position_ids"],
+            block_mask=prep["block_mask"],
             noise_embedding=noise_embedding,
         )
 
-        return draft_hidden, anchor_positions, block_keep_mask, n_blocks
+    def _draft_backbone(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states_list: List[torch.Tensor],
+        loss_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """
+        Shared DFlash backbone (context features → anchor sampling → noise
+        embedding → position ids → block-causal mask → draft model forward).
+
+        Both ``DFlashModel.forward`` and ``DSparkModel.forward`` build the draft
+        hidden states this exact way; only the label/loss tail differs. Keeping
+        the attention/mask/anchor wiring here gives it a single source of truth.
+
+        Returns:
+            draft_hidden: [B, n_blocks*block_size, D] pre-loss draft hidden states
+            anchor_positions: [B, n_blocks] sampled anchor positions
+            block_keep_mask: [B, n_blocks] bool validity of each anchor slot
+            n_blocks: number of anchor slots (== num_anchors)
+        """
+        prep = self._prepare_draft_inputs(input_ids, hidden_states_list, loss_mask)
+        draft_hidden = self._run_draft(prep, prep["noise_ids"])
+        return (
+            draft_hidden,
+            prep["anchor_positions"],
+            prep["block_keep_mask"],
+            prep["n_blocks"],
+        )
+
+    @torch.no_grad()
+    def _predict_tokens(
+        self,
+        draft_hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        chunk_size: int = 2048,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Chunked argmax + log-confidence over the vocab.
+
+        Returns (pred_ids [B, L], conf [B, L]) where conf is log P(argmax)
+        (max logit minus logsumexp — monotone in the softmax probability
+        without materializing a full-vocab softmax).
+        """
+        preds, confs = [], []
+        for chunk in draft_hidden.split(chunk_size, dim=1):
+            if hasattr(self.draft_model, "lm_head"):
+                logits = self.draft_model.lm_head(chunk).float()
+            else:
+                logits = F.linear(chunk, lm_head_weight).float()
+            mx, argmax = logits.max(dim=-1)
+            confs.append(mx - torch.logsumexp(logits, dim=-1))
+            preds.append(argmax)
+        return torch.cat(preds, dim=1), torch.cat(confs, dim=1)
+
+    @torch.no_grad()
+    def _confidence_from_logits(self, logits: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
+        """Log-confidence of the argmax from already-computed logits [B, L, V]."""
+        confs = []
+        for chunk in logits.split(chunk_size, dim=1):
+            chunk = chunk.float()
+            confs.append(chunk.max(dim=-1).values - torch.logsumexp(chunk, dim=-1))
+        return torch.cat(confs, dim=1)
+
+    @torch.no_grad()
+    def _reveal_from_confidence(
+        self,
+        conf: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        reveal_block_mask: torch.Tensor,
+        keep_frac: torch.Tensor,
+    ) -> torch.Tensor:
+        """Choose which slots to reveal: the top-``keep_frac`` most confident
+        non-anchor slots of each selected block.
+
+        Args:
+            conf: [B, n_blocks*block_size] per-slot log-confidence
+            block_keep_mask: [B, n_blocks] anchor-slot validity
+            reveal_block_mask: [B, n_blocks] blocks eligible for revealing
+            keep_frac: [B, n_blocks] fraction of the block_size-1 predictable
+                slots to reveal, in [0, 1)
+
+        Returns:
+            revealed: [B, n_blocks, block_size] bool; slot 0 (anchor) never revealed
+        """
+        bsz, n = block_keep_mask.shape
+        bs = self.block_size
+        device = conf.device
+
+        conf3 = conf.view(bsz, n, bs).clone()
+        conf3[..., 0] = float("-inf")  # the anchor slot already holds a real token
+
+        n_keep = (keep_frac.clamp(0.0, 1.0) * (bs - 1)).floor().long()  # [B, n]
+
+        order = conf3.argsort(dim=-1, descending=True)
+        ranks = torch.empty_like(order)
+        ranks.scatter_(-1, order, torch.arange(bs, device=device).view(1, 1, bs).expand_as(order))
+        revealed = ranks < n_keep.unsqueeze(-1)
+        revealed &= (reveal_block_mask & block_keep_mask).unsqueeze(-1)
+        revealed[..., 0] = False
+        return revealed
+
+    @staticmethod
+    def _logit_schedule(x: float, alpha: float) -> float:
+        """Normalized logistic S-curve through (0,0) and (1,1).
+
+        alpha=0 degenerates to linear; larger alpha concentrates commits in
+        the middle of the schedule (slow start, fast middle, slow end) —
+        the masked-diffusion analogue of the flow timestep shift.
+        """
+        if alpha == 0.0:
+            return x
+        g0 = 1.0 / (1.0 + math.exp(0.5 * alpha))
+        g1 = 1.0 / (1.0 + math.exp(-0.5 * alpha))
+        gx = 1.0 / (1.0 + math.exp(-alpha * (x - 0.5)))
+        return (gx - g0) / (g1 - g0)
+
+    @torch.no_grad()
+    def sample_scheduled(
+        self,
+        prep: dict,
+        lm_head_weight: torch.Tensor,
+        num_passes: int,
+        schedule_alpha: float = 4.0,
+    ) -> torch.Tensor:
+        """Multi-pass masked-diffusion sampling over prepared draft inputs.
+
+        Logit-spaced cumulative commit schedule: entering pass p+1, the top
+        ``_logit_schedule(p/num_passes)`` fraction of non-anchor slots (ranked
+        by the model's current confidence) carry their current predicted
+        tokens; the rest return to MASK. Every pass re-ranks ALL slots, so a
+        committed slot may be revised or remasked until the final pass — the
+        behaviour self-conditioned training licenses. Pass 1 always starts
+        from the all-MASK block; ``num_passes=1`` is the standard DFlash
+        one-jump. The final output is the last pass's argmax at every slot.
+
+        Returns:
+            final_preds: [B, n_blocks*block_size] predicted token ids
+        """
+        if num_passes < 1:
+            raise ValueError(f"num_passes must be >= 1, got {num_passes}")
+        bsz = prep["block_keep_mask"].shape[0]
+        n_blocks = prep["n_blocks"]
+        keep_mask = prep["block_keep_mask"]
+        base_ids = prep["noise_ids"]
+
+        ids = base_ids
+        preds = None
+        for p in range(1, num_passes + 1):
+            hidden = self._run_draft(prep, ids)
+            preds, conf = self._predict_tokens(hidden, lm_head_weight)
+            if p == num_passes:
+                break
+            frac = self._logit_schedule(p / num_passes, schedule_alpha)
+            keep_frac = torch.full((bsz, n_blocks), frac, device=base_ids.device)
+            committed = self._reveal_from_confidence(conf, keep_mask, keep_mask, keep_frac)
+            ids = torch.where(committed.view(bsz, -1), preds, base_ids)
+        return preds
+
+    @staticmethod
+    def _consecutive_len(correct3: torch.Tensor, valid3: torch.Tensor) -> torch.Tensor:
+        """Mean per-block consecutive-correct length starting at slot 1.
+
+        correct3/valid3: [B, n_blocks, block_size]; blocks without a valid
+        slot-1 label are excluded from the denominator.
+        """
+        if correct3.shape[-1] > 1:
+            has_p1 = valid3[..., 1]
+        else:
+            has_p1 = valid3[..., 0]
+        n_valid_blocks = has_p1.float().sum().clamp(min=1.0)
+        run = (correct3 & valid3)[..., 1:].int().cumprod(dim=-1)
+        return (run.sum(dim=-1).float() * has_p1.float()).sum() / n_valid_blocks
 
     def forward(
         self,
@@ -342,10 +556,75 @@ class DFlashModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        # 1-6. Shared backbone → draft hidden states + anchor bookkeeping.
-        draft_hidden, anchor_positions, block_keep_mask, n_blocks = self._draft_backbone(
-            input_ids, hidden_states_list, loss_mask
-        )
+        # 1-5. Prepare shared draft inputs. The attention mask is content-
+        # independent (anchors/validity/positions only), so the same prepared
+        # bundle legally serves every pass below.
+        prep = self._prepare_draft_inputs(input_ids, hidden_states_list, loss_mask)
+        anchor_positions = prep["anchor_positions"]
+        block_keep_mask = prep["block_keep_mask"]
+        n_blocks = prep["n_blocks"]
+        noise_ids = prep["noise_ids"]
+
+        # Self-conditioning (training only): a no-grad dry run on the all-MASK
+        # block predicts every slot; for a random subset of blocks the most
+        # confident predictions are revealed as inputs (the rest stay MASK) and
+        # the gradient pass learns on blocks containing the model's own —
+        # possibly wrong — tokens. This is the training-side twin of remask
+        # sampling: inference pass 2 sees exactly this input distribution.
+        # The dry run executes unconditionally on every rank whenever the
+        # feature is on, keeping the FSDP collective sequence rank-uniform.
+        self_cond_active = self.training and self.self_cond_frac > 0.0 and self.block_size > 1
+        self_cond_blocks = None
+        if self_cond_active:
+            with torch.no_grad():
+                dry_hidden = self._run_draft(prep, noise_ids)
+                dry_pred_ids, dry_conf = self._predict_tokens(dry_hidden, lm_head_weight)
+                self_cond_blocks = (
+                    torch.rand(bsz, n_blocks, device=device) < self.self_cond_frac
+                ) & block_keep_mask
+                keep_frac = torch.rand(bsz, n_blocks, device=device) * self.self_cond_keep_max
+
+                if self.self_cond_rounds > 1:
+                    # Second dry round: run the model once more from an
+                    # intermediate (early-schedule) revealed state, so half the
+                    # self-conditioned blocks train on REFINED beliefs at HIGH
+                    # reveal fractions — the late-sampler-pass states a
+                    # single-round dry run can never produce. Both dry passes
+                    # execute unconditionally on every rank (FSDP-safe).
+                    mid_frac = torch.rand(bsz, n_blocks, device=device) * 0.6
+                    mid_revealed = self._reveal_from_confidence(
+                        dry_conf, block_keep_mask, self_cond_blocks, mid_frac
+                    )
+                    mid_ids = torch.where(mid_revealed.view(bsz, -1), dry_pred_ids, noise_ids)
+                    dry2_hidden = self._run_draft(prep, mid_ids)
+                    dry2_pred_ids, dry2_conf = self._predict_tokens(dry2_hidden, lm_head_weight)
+
+                    round2 = (torch.rand(bsz, n_blocks, device=device) < 0.5) & self_cond_blocks
+                    round2_flat = round2.repeat_interleave(self.block_size, dim=1)
+                    dry_pred_ids = torch.where(round2_flat, dry2_pred_ids, dry_pred_ids)
+                    dry_conf = torch.where(round2_flat, dry2_conf, dry_conf)
+                    hi = self.self_cond_round2_keep_min + torch.rand(
+                        bsz, n_blocks, device=device
+                    ) * (self.self_cond_keep_max - self.self_cond_round2_keep_min)
+                    keep_frac = torch.where(round2, hi, keep_frac)
+
+                if self.self_cond_random_frac > 0.0:
+                    # Exploration: some blocks reveal a random subset instead of
+                    # the top-confidence one, for robustness to eval schedules
+                    # whose keep rule differs from pure confidence ranking.
+                    rand_blocks = (
+                        torch.rand(bsz, n_blocks, device=device) < self.self_cond_random_frac
+                    ) & self_cond_blocks
+                    rand_flat = rand_blocks.repeat_interleave(self.block_size, dim=1)
+                    dry_conf = torch.where(rand_flat, torch.rand_like(dry_conf), dry_conf)
+
+                revealed = self._reveal_from_confidence(
+                    dry_conf, block_keep_mask, self_cond_blocks, keep_frac
+                )
+                noise_ids = torch.where(revealed.view(bsz, -1), dry_pred_ids, noise_ids)
+
+        # 6. Draft forward on the (possibly self-conditioned) block content.
+        draft_hidden = self._run_draft(prep, noise_ids)
 
         # 7. Compute logits via frozen LM head
         logits = (
@@ -386,7 +665,14 @@ class DFlashModel(nn.Module):
         # "did we predict correctly?" uniformly across positions, while weighting
         # only shapes gradient contribution. SpecForge uses no decay at all;
         # our objective weighting is an addition to the training signal, not the metric.
-        binary_eval_mask = weight_mask.view(-1)
+        # Self-conditioned blocks are excluded from METRICS (never from the loss):
+        # their inputs contain revealed tokens, so "accuracy" there is not a
+        # prediction metric. The surviving all-MASK blocks are a uniform random
+        # subset, keeping train metrics directly comparable to stock DFlash.
+        metric_mask = weight_mask
+        if self_cond_blocks is not None:
+            metric_mask = weight_mask * (~self_cond_blocks).unsqueeze(-1).float()
+        binary_eval_mask = metric_mask.view(-1)
 
         # 9. Per-token loss: ce_loss_alpha*CE + l1_loss_alpha*L1.
         vocab_size = logits.size(-1)
@@ -440,6 +726,8 @@ class DFlashModel(nn.Module):
         valid_token_count = flat_weights.sum().clamp(min=1e-6)
         loss = (loss_per_token * flat_weights).sum() / valid_token_count
 
+        loss_components = {}
+
         # 10. Accuracy (using binary mask without decay)
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
@@ -461,7 +749,48 @@ class DFlashModel(nn.Module):
                 dim=(0, 1)
             ) / count_per_pos
 
-        loss_components = {}
+            # Per-block consecutive-correct length starting at position 1: a greedy
+            # accept-length proxy that, unlike simulated_acc_len (a product of
+            # per-position marginals), captures within-block correlation. Blocks
+            # truncated by the sequence end under-count equally for all paths.
+            correct3 = correct.view(bsz, n_blocks, self.block_size)
+            valid3 = binary_weights > 0.5
+            loss_components["block_acc_len_det"] = self._consecutive_len(correct3, valid3)
+
+            # Two-pass remask sampling (eval only): keep the most confident
+            # pass-1 tokens, re-mask the rest, run a second pass that predicts
+            # the doubtful slots with the kept tokens visible in the block.
+            # ReMDM-style inference-time refinement, measured two ways:
+            #   frozen — kept tokens are final, pass 2 fills only re-masked slots
+            #   revise — pass 2 re-predicts every slot (kept tokens steer attention)
+            if (not self.training) and self.remask_eval_keep > 0.0 and self.block_size > 1:
+                conf = self._confidence_from_logits(logits)
+                keep_frac = torch.full((bsz, n_blocks), self.remask_eval_keep, device=device)
+                revealed_eval = self._reveal_from_confidence(
+                    conf, block_keep_mask, block_keep_mask, keep_frac
+                )
+                flat_revealed = revealed_eval.view(bsz, -1)
+                pred_p1 = pred_ids.view(bsz, -1)
+                remask_ids = torch.where(flat_revealed, pred_p1, prep["noise_ids"])
+                hidden_p2 = self._run_draft(prep, remask_ids)
+                pred_p2, _ = self._predict_tokens(hidden_p2, lm_head_weight)
+
+                targets2 = flat_targets.view(bsz, -1)
+                final_frozen = torch.where(flat_revealed, pred_p1, pred_p2)
+                frozen_correct = (final_frozen == targets2).view(bsz, n_blocks, self.block_size)
+                revise_correct = (pred_p2 == targets2).view(bsz, n_blocks, self.block_size)
+                loss_components["block_acc_len_remask"] = self._consecutive_len(
+                    frozen_correct, valid3
+                )
+                loss_components["block_acc_len_revise"] = self._consecutive_len(
+                    revise_correct, valid3
+                )
+                kept = flat_revealed & (binary_weights.view(bsz, -1) > 0.5)
+                kept_count = kept.float().sum().clamp(min=1.0)
+                loss_components["remask_keep_acc"] = (
+                    (pred_p1 == targets2) & kept
+                ).float().sum() / kept_count
+
         return (
             loss,
             accuracy,

@@ -441,7 +441,9 @@ class TestDFlashModelForward(unittest.TestCase):
         self.assertEqual(loss_pp.shape, (self.model.block_size,))
         self.assertEqual(acc_pp.shape, (self.model.block_size,))
         self.assertEqual(count_pp.shape, (self.model.block_size,))
-        self.assertEqual(loss_components, {})
+        # Without a flow head only the det-path coherence metric is emitted.
+        self.assertEqual(set(loss_components.keys()), {"block_acc_len_det"})
+        self.assertGreaterEqual(loss_components["block_acc_len_det"].item(), 0.0)
 
     def test_loss_requires_grad(self):
         """Loss should be differentiable through the draft model."""
@@ -1395,12 +1397,21 @@ class TestExtraLossComponentAggregation(unittest.TestCase):
             ["ce_loss", "l1_loss", "confidence_loss"],
         )
 
-    def test_dflash_declares_no_components(self):
+    def test_dflash_declares_block_len_component(self):
         from torchspec.training.dflash_trainer import DFlashTrainer
 
-        self.assertEqual(DFlashTrainer._extra_loss_component_keys, [])
+        self.assertEqual(
+            DFlashTrainer._extra_loss_component_keys,
+            [
+                "block_acc_len_det",
+                "block_acc_len_remask",
+                "block_acc_len_revise",
+                "remask_keep_acc",
+            ],
+        )
         trainer = object.__new__(DFlashTrainer)
-        # No keys to reduce → no-op even if components are present in the steps.
+        # Undeclared keys are ignored; declared keys absent from the step metrics
+        # (e.g. flow components on a baseline run) reduce to nothing.
         out = trainer._reduce_loss_components([{"ce_loss": torch.tensor(1.0)}], "train/")
         self.assertEqual(out, {})
 

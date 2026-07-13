@@ -50,7 +50,12 @@ class DFlashTrainer(Trainer):
 
     _draft_config_class = DFlashConfig
     _anchor_slot_offset = 1
-    _extra_loss_component_keys: list[str] = []
+    _extra_loss_component_keys: list[str] = [
+        "block_acc_len_det",
+        "block_acc_len_remask",
+        "block_acc_len_revise",
+        "remask_keep_acc",
+    ]
 
     def _build_draft_model(self, config):
         """Instantiate the draft network. Overridden by subclasses."""
@@ -67,6 +72,12 @@ class DFlashTrainer(Trainer):
             loss_decay_gamma=self.loss_decay_gamma,
             ce_loss_alpha=self.ce_loss_alpha,
             l1_loss_alpha=self.l1_loss_alpha,
+            self_cond_frac=self.self_cond_frac,
+            self_cond_keep_max=self.self_cond_keep_max,
+            remask_eval_keep=self.remask_eval_keep,
+            self_cond_rounds=self.self_cond_rounds,
+            self_cond_round2_keep_min=self.self_cond_round2_keep_min,
+            self_cond_random_frac=self.self_cond_random_frac,
         )
 
     def __init__(self, args: Namespace):
@@ -80,6 +91,12 @@ class DFlashTrainer(Trainer):
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
         self.ce_loss_alpha = getattr(args, "dflash_ce_loss_alpha", 1.0)
         self.l1_loss_alpha = getattr(args, "dflash_l1_loss_alpha", 0.0)
+        self.self_cond_frac = getattr(args, "dflash_self_cond_frac", 0.0)
+        self.self_cond_keep_max = getattr(args, "dflash_self_cond_keep_max", 0.75)
+        self.remask_eval_keep = getattr(args, "dflash_remask_eval_keep", 0.0)
+        self.self_cond_rounds = getattr(args, "dflash_self_cond_rounds", 1)
+        self.self_cond_round2_keep_min = getattr(args, "dflash_self_cond_round2_keep_min", 0.4)
+        self.self_cond_random_frac = getattr(args, "dflash_self_cond_random_frac", 0.0)
 
     def init_model(
         self,
