@@ -88,6 +88,7 @@ _sglang/
 wandb/log.txt
 
 .claude/
+.tmp/
 wandb/
 data/
 profiles/

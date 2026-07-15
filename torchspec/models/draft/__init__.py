@@ -23,6 +23,7 @@ from torchspec.models.draft.base import Eagle3DraftModel
 from torchspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
 from torchspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from torchspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
+from torchspec.models.draft.flowspec import FlowSpecConfig, FlowSpecDraftModel
 from torchspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 
 __all__ = [
@@ -34,5 +35,7 @@ __all__ = [
     "DFlashDraftModel",
     "DSparkConfig",
     "DSparkDraftModel",
+    "FlowSpecConfig",
+    "FlowSpecDraftModel",
     "LlamaForCausalLMEagle3",
 ]

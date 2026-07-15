@@ -10,6 +10,7 @@ Covers:
 
 import math
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -441,7 +442,8 @@ class TestDFlashModelForward(unittest.TestCase):
         self.assertEqual(loss_pp.shape, (self.model.block_size,))
         self.assertEqual(acc_pp.shape, (self.model.block_size,))
         self.assertEqual(count_pp.shape, (self.model.block_size,))
-        self.assertEqual(loss_components, {})
+        self.assertEqual(loss_components["block_match_length"].shape, ())
+        self.assertGreaterEqual(loss_components["block_match_length"].item(), 0)
 
     def test_loss_requires_grad(self):
         """Loss should be differentiable through the draft model."""
@@ -635,11 +637,13 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
                 loss_key: torch.tensor([0.0, 1.0, 5.0, 0.0]),
                 acc_key: torch.tensor([0.0, 0.5, 1.0, 0.0]),
                 count_key: torch.tensor([0.0, 10.0, 2.0, 0.0]),
+                "block_match_length": torch.tensor(1.4),
             },
             {
                 loss_key: torch.tensor([0.0, 0.0, 2.0, 4.0]),
                 acc_key: torch.tensor([0.0, 0.0, 0.25, 0.5]),
                 count_key: torch.tensor([0.0, 0.0, 8.0, 4.0]),
+                "block_match_length": torch.tensor(0.6),
             },
         ]
 
@@ -674,6 +678,7 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
         self.assertAlmostEqual(metrics["train/avg_acc"], 11.0 / 24.0, places=6)
         self.assertAlmostEqual(metrics["train/avg_loss"], self._expected_avg_loss(), places=6)
         self.assertAlmostEqual(metrics["train/simulated_acc_len"], 0.8, places=6)
+        self.assertAlmostEqual(metrics["train/block_match_length"], 1.0, places=6)
 
     @mock.patch("torchspec.training.dflash_trainer.dist.get_rank", return_value=0)
     @mock.patch(
@@ -697,6 +702,22 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
         self.assertAlmostEqual(metrics["eval/avg_acc"], 11.0 / 24.0, places=6)
         self.assertAlmostEqual(metrics["eval/avg_loss"], self._expected_avg_loss(), places=6)
         self.assertAlmostEqual(metrics["eval/simulated_acc_len"], 0.8, places=6)
+        self.assertAlmostEqual(metrics["eval/block_match_length"], 1.0, places=6)
+
+    def test_eval_rng_is_reproducible_and_does_not_advance_training_rng(self):
+        trainer = self._make_trainer()
+        trainer.args = SimpleNamespace(eval_seed=1234)
+
+        torch.manual_seed(99)
+        state_before = torch.random.get_rng_state()
+        with trainer._isolated_eval_rng():
+            first = torch.rand(4)
+        state_after = torch.random.get_rng_state()
+        with trainer._isolated_eval_rng():
+            second = torch.rand(4)
+
+        torch.testing.assert_close(first, second)
+        torch.testing.assert_close(state_before, state_after)
 
 
 class TestMiniTrainingLoop(unittest.TestCase):
@@ -1395,14 +1416,19 @@ class TestExtraLossComponentAggregation(unittest.TestCase):
             ["ce_loss", "l1_loss", "confidence_loss"],
         )
 
-    def test_dflash_declares_no_components(self):
+    def test_dflash_declares_block_match_component(self):
         from torchspec.training.dflash_trainer import DFlashTrainer
 
-        self.assertEqual(DFlashTrainer._extra_loss_component_keys, [])
+        self.assertEqual(DFlashTrainer._extra_loss_component_keys, ["block_match_length"])
         trainer = object.__new__(DFlashTrainer)
-        # No keys to reduce → no-op even if components are present in the steps.
-        out = trainer._reduce_loss_components([{"ce_loss": torch.tensor(1.0)}], "train/")
-        self.assertEqual(out, {})
+        out = trainer._reduce_loss_components(
+            [
+                {"block_match_length": torch.tensor(1.0)},
+                {"block_match_length": torch.tensor(3.0)},
+            ],
+            "train/",
+        )
+        self.assertEqual(out, {"train/block_match_length": 2.0})
 
     @mock.patch("torchspec.training.dflash_trainer.dist.get_rank", return_value=0)
     @mock.patch(

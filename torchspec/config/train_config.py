@@ -40,7 +40,7 @@ class DatasetConfig:
     eval_micro_batch_size: Optional[int] = None
     eval_prompt_key: Optional[str] = None
     last_turn_loss_only: Any = "auto"  # bool or "auto"
-    min_loss_tokens: int = 0  # DFlash: skip sequences with < N supervised tokens (use 2*block_size)
+    min_loss_tokens: int = 0
     prompt_key: str = "conversations"
     shuffle_dataset: bool = True
     train_data_path: str = ""
@@ -98,6 +98,8 @@ class TrainingConfig:
     distributed_backend: str = "nccl"
     distributed_timeout_minutes: int = 10
     draft_accumulation_steps: int = 1
+    eval_at_start: bool = False
+    eval_seed: Optional[int] = None
     fsdp_reduce_dtype: str = "float32"  # "float32" or "bfloat16"
     fsdp_strategy: str = "REPLICATE"
     # Controls which workload claims head-node GPUs first under PACK strategy.
@@ -161,6 +163,19 @@ class TrainingConfig:
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+
+    # FlowSpec-specific parameters (used by FlowSpec trainer only)
+    flowspec_block_size: int = 8
+    flowspec_num_anchors: int = 512
+    flowspec_num_target_layers: int = 5
+    flowspec_uniform_ce_weight: float = 0.1
+    flowspec_boundary_probability: float = 0.0
+    flowspec_use_target_distribution: bool = False
+    flowspec_ode_eval_max_samples: int = 0
+    flowspec_ode_eval_seed: int = 1234
+    flowspec_ode_eval_step_counts: Optional[list[int]] = None
+    flowspec_ode_eval_steps: int = 0
+    flowspec_use_time_reparameterization: bool = True
 
 
 @dataclass

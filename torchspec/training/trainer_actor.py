@@ -27,6 +27,7 @@ import torch.distributed as dist
 from torchspec import AutoDraftModelConfig
 from torchspec.models.draft.dflash import DFlashConfig
 from torchspec.models.draft.dspark import DSparkConfig
+from torchspec.models.draft.flowspec import FlowSpecConfig
 from torchspec.ray.ray_actor import RayActor
 from torchspec.training.eagle3_trainer import Eagle3Trainer
 from torchspec.utils.distributed import init_gloo_group, init_usp_groups
@@ -81,7 +82,11 @@ class TrainerActor(RayActor):
         # - DSparkConfig → DSparkTrainer
         # - DFlashConfig → DFlashTrainer
         # - else Eagle3.
-        if isinstance(draft_model_config, DSparkConfig):
+        if isinstance(draft_model_config, FlowSpecConfig):
+            from torchspec.training.flowspec_trainer import FlowSpecTrainer
+
+            self._trainer = FlowSpecTrainer(args)
+        elif isinstance(draft_model_config, DSparkConfig):
             from torchspec.training.dspark_trainer import DSparkTrainer
 
             self._trainer = DSparkTrainer(args)
@@ -147,3 +152,14 @@ class TrainerActor(RayActor):
 
     def eval_from_cache(self) -> dict:
         return self._trainer.eval_from_cache()
+
+    def flowspec_ode_eval_from_cache(
+        self,
+        num_steps: int,
+        max_samples: int,
+        seed: int,
+    ) -> dict:
+        evaluator = getattr(self._trainer, "ode_eval_from_cache", None)
+        if evaluator is None:
+            return {}
+        return evaluator(num_steps=num_steps, max_samples=max_samples, seed=seed)
