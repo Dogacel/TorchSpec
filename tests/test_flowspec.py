@@ -80,6 +80,7 @@ def _make_wrapper(
     num_anchors: int = 4,
     use_time_reparameterization: bool = False,
     boundary_probability: float = 0.0,
+    block_time_max_exponent: float = 1.0,
     use_target_distribution: bool = False,
 ) -> FlowSpecModel:
     draft_model = FlowSpecDraftModel(_make_config())
@@ -89,6 +90,7 @@ def _make_wrapper(
         num_anchors=num_anchors,
         use_time_reparameterization=use_time_reparameterization,
         boundary_probability=boundary_probability,
+        block_time_max_exponent=block_time_max_exponent,
         use_target_distribution=use_target_distribution,
         use_flex_attention=False,
     )
@@ -139,8 +141,9 @@ class TestFlowSpecConfig(unittest.TestCase):
 
     def test_ode_eval_defaults_are_disabled(self):
         training = Config().training
-        self.assertEqual(training.flowspec_uniform_ce_weight, 0.1)
+        self.assertEqual(training.flowspec_loss_decay_gamma, 7.0)
         self.assertEqual(training.flowspec_boundary_probability, 0.0)
+        self.assertEqual(training.flowspec_block_time_max_exponent, 1.0)
         self.assertFalse(training.flowspec_use_target_distribution)
         self.assertEqual(training.flowspec_ode_eval_steps, 0)
         self.assertIsNone(training.flowspec_ode_eval_step_counts)
@@ -407,12 +410,12 @@ class TestFlowSpecWrapper(unittest.TestCase):
         )
         self.assertEqual(model.block_size, 8)
 
-    def test_rejects_invalid_uniform_ce_weight(self):
-        for weight in (-0.1, 1.1):
-            with self.subTest(weight=weight), self.assertRaises(ValueError):
+    def test_rejects_invalid_loss_decay_gamma(self):
+        for gamma in (-0.1, 0.0, float("inf"), float("nan")):
+            with self.subTest(gamma=gamma), self.assertRaises(ValueError):
                 FlowSpecModel(
                     FlowSpecDraftModel(_make_config()),
-                    uniform_ce_weight=weight,
+                    loss_decay_gamma=gamma,
                     use_time_reparameterization=False,
                     use_flex_attention=False,
                 )
@@ -423,6 +426,16 @@ class TestFlowSpecWrapper(unittest.TestCase):
                 FlowSpecModel(
                     FlowSpecDraftModel(_make_config()),
                     boundary_probability=probability,
+                    use_time_reparameterization=False,
+                    use_flex_attention=False,
+                )
+
+    def test_rejects_invalid_block_time_exponent(self):
+        for exponent in (0.9, float("inf"), float("nan")):
+            with self.subTest(exponent=exponent), self.assertRaises(ValueError):
+                FlowSpecModel(
+                    FlowSpecDraftModel(_make_config()),
+                    block_time_max_exponent=exponent,
                     use_time_reparameterization=False,
                     use_flex_attention=False,
                 )
@@ -445,6 +458,43 @@ class TestFlowSpecWrapper(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected)
         self.assertTrue(bool((actual == 0.0).any()))
+
+    def test_block_time_power_schedule_staggers_later_positions(self):
+        model = _make_wrapper(
+            block_size=3,
+            block_time_max_exponent=2.0,
+        )
+        tau = torch.tensor([[0.0, 0.25, 1.0]])
+
+        token_tau, physical_time = model._block_time_coordinates(tau)
+
+        expected = torch.tensor([[[0.0, 0.0, 0.0], [0.25, 0.125, 0.0625], [1.0, 1.0, 1.0]]])
+        torch.testing.assert_close(physical_time, expected)
+        torch.testing.assert_close(token_tau, expected)
+
+    def test_block_time_power_is_applied_before_lut_inverse(self):
+        model = _make_wrapper(
+            block_size=3,
+            block_time_max_exponent=2.0,
+            use_time_reparameterization=True,
+        )
+        tau = torch.tensor([[0.5]])
+
+        token_tau, physical_time = model._block_time_coordinates(tau)
+
+        expected_tau = torch.tensor([[[0.5, 0.5**1.5, 0.25]]])
+        torch.testing.assert_close(token_tau, expected_tau)
+        torch.testing.assert_close(physical_time, model.tau_to_time(expected_tau))
+
+    def test_default_block_time_schedule_is_exactly_shared(self):
+        model = _make_wrapper(block_size=3)
+        tau = torch.tensor([[0.1, 0.5, 0.9]])
+
+        token_tau, physical_time = model._block_time_coordinates(tau)
+
+        expected = tau.unsqueeze(-1).expand(-1, -1, 3)
+        torch.testing.assert_close(token_tau, expected)
+        torch.testing.assert_close(physical_time, expected)
 
     def test_anchor_requires_complete_supervised_future_block(self):
         model = _make_wrapper(block_size=3, num_anchors=4)
@@ -562,44 +612,15 @@ class TestFlowSpecWrapper(unittest.TestCase):
             loss_mask=loss_mask,
         )
         uniform_ce = math.log(model.draft_model.config.vocab_size)
-        uniform_probability = 1.0 / model.draft_model.config.vocab_size
-        soft_acceptance = sum(uniform_probability ** (position + 1) for position in range(8))
-        acceptance_loss = -math.log(soft_acceptance / 8)
-        expected_loss = 0.1 * uniform_ce + 0.9 * acceptance_loss / 8
-        self.assertAlmostEqual(loss.item(), expected_loss, places=5)
-        self.assertAlmostEqual(components["objective_loss"].item(), expected_loss, places=5)
+        self.assertAlmostEqual(loss.item(), uniform_ce, places=5)
+        self.assertAlmostEqual(components["objective_loss"].item(), uniform_ce, places=5)
         self.assertEqual(accuracy.item(), 0.0)
         self.assertEqual(loss_per_position.shape, (8,))
         torch.testing.assert_close(count_per_position, torch.full((8,), 2.0))
-        self.assertAlmostEqual(components["uniform_ce_loss"].item(), uniform_ce, places=5)
-        self.assertAlmostEqual(
-            components["soft_acceptance_length"].item(), soft_acceptance, places=6
-        )
-
-    def test_forward_reports_greedy_target_prefix_metrics(self):
-        model = _make_wrapper(block_size=3, num_anchors=2)
-        batch_size, sequence_len = 1, 8
-        hidden_size = model.draft_model.config.target_hidden_size
-        hidden_states = [
-            torch.randn(batch_size, sequence_len, hidden_size)
-            for _ in range(model.draft_model.config.num_target_layers)
-        ]
-
-        *_, components = model(
-            input_ids=torch.arange(1, sequence_len + 1).unsqueeze(0),
-            hidden_states_list=hidden_states,
-            loss_mask=torch.ones(batch_size, sequence_len),
-            last_hidden_states=torch.randn(batch_size, sequence_len, hidden_size),
-            lm_head_weight=torch.zeros(model.draft_model.config.vocab_size, hidden_size),
-        )
-
         torch.testing.assert_close(
-            components["target_match_per_position"],
-            components["target_count_per_position"],
+            model.loss_decay_weights,
+            torch.exp(-torch.arange(8, dtype=torch.float32) / 7.0),
         )
-        torch.testing.assert_close(components["accepted_prefix_sum"], torch.tensor(6.0))
-        torch.testing.assert_close(components["accepted_block_count"], torch.tensor(2.0))
-        torch.testing.assert_close(components["block_match_length"], torch.tensor(0.0))
 
     def test_forward_can_train_on_qwen_distribution(self):
         model = _make_wrapper(
@@ -623,12 +644,12 @@ class TestFlowSpecWrapper(unittest.TestCase):
         )
 
         self.assertTrue(bool(torch.isfinite(loss)))
-        self.assertEqual(accuracy.item(), 1.0)
-        self.assertAlmostEqual(components["acceptance_loss"].item(), 0.0, places=6)
+        self.assertEqual(accuracy.item(), 0.0)
+        self.assertEqual(components["block_match_length"].item(), 0.0)
         self.assertAlmostEqual(
-            components["soft_acceptance_length"].item(),
-            3.0,
-            places=6,
+            components["objective_loss"].item(),
+            math.log(model.draft_model.config.vocab_size),
+            places=5,
         )
 
     def test_target_distribution_requires_target_hidden_states(self):
@@ -648,7 +669,7 @@ class TestFlowSpecWrapper(unittest.TestCase):
                 loss_mask=torch.ones(1, 6),
             )
 
-    def test_target_predictions_use_causally_aligned_hidden_states(self):
+    def test_target_logits_use_causally_aligned_hidden_states(self):
         model = _make_wrapper(block_size=3, num_anchors=1)
         hidden_size = model.draft_model.config.target_hidden_size
         vocab_size = model.draft_model.config.vocab_size
@@ -658,15 +679,15 @@ class TestFlowSpecWrapper(unittest.TestCase):
         lm_head_weight = torch.zeros(vocab_size, hidden_size)
         lm_head_weight[:hidden_size] = 10.0 * torch.eye(hidden_size)
 
-        predictions = model._target_greedy_predictions(
+        predictions = model._target_logits(
             last_hidden_states,
             lm_head_weight,
             anchor_positions=torch.tensor([[2]]),
-        )
+        ).argmax(dim=-1)
 
         torch.testing.assert_close(predictions, torch.tensor([[[2, 3, 4]]]))
 
-    def test_target_metric_inputs_must_be_paired(self):
+    def test_soft_target_inputs_must_be_paired(self):
         model = _make_wrapper(block_size=3, num_anchors=1)
         hidden_states = [
             torch.randn(1, 6, model.draft_model.config.target_hidden_size)
@@ -718,8 +739,6 @@ class TestFlowSpecWrapper(unittest.TestCase):
             hidden_states_list=hidden_states,
             loss_mask=torch.ones(batch_size, context_len),
             num_steps=2,
-            last_hidden_states=torch.randn(batch_size, context_len, hidden_size),
-            lm_head_weight=torch.zeros(model.draft_model.config.vocab_size, hidden_size),
             generator=torch.Generator().manual_seed(7),
         )
 
@@ -733,7 +752,17 @@ class TestFlowSpecWrapper(unittest.TestCase):
             torch.full((3,), 2.0),
         )
         torch.testing.assert_close(totals["block_count"], torch.tensor(2.0))
-        torch.testing.assert_close(totals["target_match_0_sum"], torch.tensor(2.0))
+        self.assertEqual(
+            set(totals),
+            {
+                "token_match_per_position",
+                "count_per_position",
+                "prefix_match_per_position",
+                "block_match_length_sum",
+                "block_count",
+                "row_count",
+            },
+        )
 
 
 class TestFlowSpecOdeEvalPartition(unittest.TestCase):

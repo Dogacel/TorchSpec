@@ -53,9 +53,6 @@ class FlowSpecTrainer(DFlashTrainer):
     _extra_loss_component_keys = [
         "block_match_length",
         "objective_loss",
-        "uniform_ce_loss",
-        "acceptance_loss",
-        "soft_acceptance_length",
     ]
 
     def __init__(self, args: Namespace):
@@ -68,18 +65,22 @@ class FlowSpecTrainer(DFlashTrainer):
             "flowspec_use_time_reparameterization",
             True,
         )
-        self.uniform_ce_weight = getattr(args, "flowspec_uniform_ce_weight", 0.1)
+        self.loss_decay_gamma = getattr(args, "flowspec_loss_decay_gamma", 7.0)
         self.boundary_probability = getattr(
             args,
             "flowspec_boundary_probability",
             0.0,
+        )
+        self.block_time_max_exponent = getattr(
+            args,
+            "flowspec_block_time_max_exponent",
+            1.0,
         )
         self.use_target_distribution = getattr(
             args,
             "flowspec_use_target_distribution",
             False,
         )
-        self.loss_decay_gamma = None
 
     def init_model(
         self,
@@ -130,8 +131,9 @@ class FlowSpecTrainer(DFlashTrainer):
             block_size=self.block_size,
             num_anchors=self.num_anchors,
             use_time_reparameterization=self.use_time_reparameterization,
-            uniform_ce_weight=self.uniform_ce_weight,
+            loss_decay_gamma=self.loss_decay_gamma,
             boundary_probability=self.boundary_probability,
+            block_time_max_exponent=self.block_time_max_exponent,
             use_target_distribution=self.use_target_distribution,
             use_flex_attention=getattr(self.args, "attention_backend", "sdpa") == "flex_attention",
         )
@@ -202,10 +204,12 @@ class FlowSpecTrainer(DFlashTrainer):
         checkpoint_payload = checkpoint.load(self)
         checkpoint.finalize_load(self, checkpoint_payload)
 
-        self._init_target_lm_head(target_model_path)
-        if self.target_lm_head is None:
-            raise ValueError("Failed to initialize the target LM head.")
-        self.target_lm_head_weight = self.target_lm_head.lm_head.weight
+        self.target_lm_head_weight = None
+        if self.use_target_distribution:
+            self._init_target_lm_head(target_model_path)
+            if self.target_lm_head is None:
+                raise ValueError("Failed to initialize the target LM head.")
+            self.target_lm_head_weight = self.target_lm_head.lm_head.weight
 
         self.prof.on_init_end()
         logger.info(f"[Rank {self.dp_rank}] FlowSpec model initialized with FSDP2")
@@ -233,13 +237,15 @@ class FlowSpecTrainer(DFlashTrainer):
             loss_mask = loss_mask.squeeze(-1)
         loss_mask = loss_mask.to(device, non_blocking=True)
 
-        last_hidden_states = batch.get("last_hidden_states")
-        if last_hidden_states is None:
-            raise ValueError(
-                "FlowSpec requires last_hidden_states for target-agreement metrics. "
-                "Set inference.store_last_hidden_states=true."
-            )
-        last_hidden_states = last_hidden_states.to(device, non_blocking=True)
+        last_hidden_states = None
+        if self.use_target_distribution:
+            last_hidden_states = batch.get("last_hidden_states")
+            if last_hidden_states is None:
+                raise ValueError(
+                    "FlowSpec soft targets require last_hidden_states. "
+                    "Set inference.store_last_hidden_states=true."
+                )
+            last_hidden_states = last_hidden_states.to(device, non_blocking=True)
 
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
@@ -250,65 +256,6 @@ class FlowSpecTrainer(DFlashTrainer):
             lm_head_weight=self.target_lm_head_weight,
             last_hidden_states=last_hidden_states,
         )
-
-    def _add_target_agreement_metrics(
-        self,
-        metrics: dict,
-        all_step_metrics: list[dict],
-        prefix: str,
-    ) -> dict:
-        required = {
-            "target_match_per_position",
-            "target_count_per_position",
-            "accepted_prefix_sum",
-            "accepted_block_count",
-        }
-        if not all(required.issubset(step_metrics) for step_metrics in all_step_metrics):
-            return metrics
-
-        match_sum = torch.stack(
-            [step_metrics["target_match_per_position"] for step_metrics in all_step_metrics]
-        ).sum(dim=0)
-        count_sum = torch.stack(
-            [step_metrics["target_count_per_position"] for step_metrics in all_step_metrics]
-        ).sum(dim=0)
-        accepted_sum = torch.stack(
-            [step_metrics["accepted_prefix_sum"] for step_metrics in all_step_metrics]
-        ).sum()
-        block_count = torch.stack(
-            [step_metrics["accepted_block_count"] for step_metrics in all_step_metrics]
-        ).sum()
-
-        dist.all_reduce(match_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(accepted_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(block_count, op=dist.ReduceOp.SUM)
-
-        target_match = match_sum / count_sum.clamp(min=1.0)
-        metrics[f"{prefix}/greedy_acceptance_length"] = (
-            accepted_sum / block_count.clamp(min=1.0)
-        ).item()
-        for position, value in enumerate(target_match):
-            metrics[f"{prefix}/target_match_{position}"] = value.item()
-        return metrics
-
-    def _aggregate_metrics(
-        self,
-        all_step_metrics: list[dict],
-        step: int,
-        *,
-        grad_norm: torch.Tensor = None,
-    ) -> dict:
-        metrics = super()._aggregate_metrics(
-            all_step_metrics,
-            step,
-            grad_norm=grad_norm,
-        )
-        return self._add_target_agreement_metrics(metrics, all_step_metrics, "train")
-
-    def _aggregate_eval_metrics(self, all_step_metrics: list[dict]) -> dict:
-        metrics = super()._aggregate_eval_metrics(all_step_metrics)
-        return self._add_target_agreement_metrics(metrics, all_step_metrics, "eval")
 
     def _aggregate_ode_eval_metrics(
         self,
@@ -322,8 +269,6 @@ class FlowSpecTrainer(DFlashTrainer):
         block_match_length_sum = torch.zeros((), device=device)
         block_count = torch.zeros((), device=device)
         row_count = torch.zeros((), device=device)
-        target_match_0_sum = torch.zeros((), device=device)
-        target_match_0_count = torch.zeros((), device=device)
 
         for step_metrics in all_step_metrics:
             match_sum += step_metrics["token_match_per_position"]
@@ -332,14 +277,6 @@ class FlowSpecTrainer(DFlashTrainer):
             block_match_length_sum += step_metrics["block_match_length_sum"]
             block_count += step_metrics["block_count"]
             row_count += step_metrics["row_count"]
-            target_match_0_sum += step_metrics.get(
-                "target_match_0_sum",
-                torch.zeros((), device=device),
-            )
-            target_match_0_count += step_metrics.get(
-                "target_match_0_count",
-                torch.zeros((), device=device),
-            )
 
         reduced = torch.cat(
             [
@@ -349,8 +286,6 @@ class FlowSpecTrainer(DFlashTrainer):
                 block_match_length_sum[None],
                 block_count[None],
                 row_count[None],
-                target_match_0_sum[None],
-                target_match_0_count[None],
             ]
         )
         dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
@@ -359,13 +294,7 @@ class FlowSpecTrainer(DFlashTrainer):
         match_sum = reduced[:offset]
         count_sum = reduced[offset : 2 * offset]
         prefix_match_sum = reduced[2 * offset : 3 * offset]
-        (
-            block_match_length_sum,
-            block_count,
-            row_count,
-            target_match_0_sum,
-            target_match_0_count,
-        ) = reduced[3 * offset :]
+        block_match_length_sum, block_count, row_count = reduced[3 * offset :]
         accuracy = match_sum / count_sum.clamp(min=1.0)
         prefix_match = prefix_match_sum / block_count.clamp(min=1.0)
         conditional_match = torch.zeros_like(prefix_match)
@@ -376,16 +305,9 @@ class FlowSpecTrainer(DFlashTrainer):
             torch.zeros_like(prefix_match[1:]),
         )
 
-        simulated_length = 0.0
-        cumulative = 1.0
-        for value in accuracy:
-            cumulative *= value.item()
-            simulated_length += cumulative
-
         prefix = "ode_eval/"
         metrics = {
             f"{prefix}avg_acc": (match_sum.sum() / count_sum.sum().clamp(min=1.0)).item(),
-            f"{prefix}simulated_acc_len": simulated_length,
             f"{prefix}block_match_length": (
                 block_match_length_sum / block_count.clamp(min=1.0)
             ).item(),
@@ -393,8 +315,6 @@ class FlowSpecTrainer(DFlashTrainer):
             f"{prefix}num_blocks": block_count.item(),
             f"{prefix}num_steps": num_steps,
         }
-        if target_match_0_count.item() > 0:
-            metrics[f"{prefix}target_match_0"] = (target_match_0_sum / target_match_0_count).item()
         for position, value in enumerate(accuracy):
             metrics[f"{prefix}acc_{position}"] = value.item()
             metrics[f"{prefix}prefix_match_{position}"] = prefix_match[position].item()
@@ -436,12 +356,6 @@ class FlowSpecTrainer(DFlashTrainer):
                 if loss_mask.dim() == 3:
                     loss_mask = loss_mask.squeeze(-1)
                 loss_mask = loss_mask.cuda()
-                last_hidden_states = batch.get("last_hidden_states")
-                if last_hidden_states is None:
-                    raise ValueError(
-                        "FlowSpec ODE evaluation requires last_hidden_states for target_match_0."
-                    )
-                last_hidden_states = last_hidden_states.cuda()
                 hidden_states_list = self._split_hidden_states(hidden_states)
                 del hidden_states
 
@@ -451,8 +365,6 @@ class FlowSpecTrainer(DFlashTrainer):
                         hidden_states_list=hidden_states_list,
                         loss_mask=loss_mask,
                         num_steps=num_steps,
-                        lm_head_weight=self.target_lm_head_weight,
-                        last_hidden_states=last_hidden_states,
                         generator=generator,
                     )
                 )
@@ -460,6 +372,7 @@ class FlowSpecTrainer(DFlashTrainer):
             self.model.train()
 
         metrics = self._aggregate_ode_eval_metrics(all_metrics, num_steps)
+        metrics["ode_eval/step"] = self.global_step
         if rank == 0:
             logger.info(
                 "ODE eval: steps=%d rows=%d acc_0=%.4f block_match_length=%.2f",

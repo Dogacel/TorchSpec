@@ -168,8 +168,9 @@ class TrainingConfig:
     flowspec_block_size: int = 8
     flowspec_num_anchors: int = 512
     flowspec_num_target_layers: int = 5
-    flowspec_uniform_ce_weight: float = 0.1
+    flowspec_loss_decay_gamma: float = 7.0
     flowspec_boundary_probability: float = 0.0
+    flowspec_block_time_max_exponent: float = 1.0
     flowspec_use_target_distribution: bool = False
     flowspec_ode_eval_max_samples: int = 0
     flowspec_ode_eval_seed: int = 1234

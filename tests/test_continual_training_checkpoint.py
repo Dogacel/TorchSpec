@@ -59,3 +59,23 @@ def test_restore_fp32_master_params_keeps_fresh_optimizer_hparams():
     assert group["weight_decay"] == 0.456
     assert optimizer.optimizer.state == {}
     assert torch.equal(optimizer.fp32_params[0].detach(), torch.tensor([42.0], dtype=torch.float32))
+
+
+def test_resume_restores_global_step():
+    actor = SimpleNamespace(
+        args=SimpleNamespace(continual_training=False, start_step=None),
+        global_step=0,
+    )
+    payload = {
+        "metadata": {"global_step": 2000, "next_step": 2001},
+        "iteration": 2001,
+    }
+
+    with (
+        mock.patch("torchspec.training.checkpoint.torch.cuda.synchronize"),
+        mock.patch("torchspec.training.checkpoint.dist.barrier"),
+    ):
+        checkpoint.finalize_load(actor, payload)
+
+    assert actor.global_step == 2000
+    assert actor.args.start_step == 2001

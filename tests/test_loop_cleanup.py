@@ -176,6 +176,7 @@ def test_run_flowspec_ode_eval_logs_separate_integrated_metrics():
             "ode_eval/acc_0": 0.35,
             "ode_eval/block_match_length": 0.6,
             "ode_eval/num_rows": 100.0,
+            "ode_eval/step": 2000,
         }
     ]
     args = SimpleNamespace(
@@ -190,7 +191,7 @@ def test_run_flowspec_ode_eval_logs_separate_integrated_metrics():
         mock.patch("torchspec.controller.eval.wandb.run", None),
     ):
         metrics = eval_utils.run_flowspec_ode_eval(
-            4000,
+            0,
             train_group,
             eval_enabled=True,
             args=args,
@@ -198,12 +199,12 @@ def test_run_flowspec_ode_eval_logs_separate_integrated_metrics():
 
     train_group.run_flowspec_ode_eval.assert_called_once_with(32, 100, 1234)
     assert metrics["ode_eval/acc_0"] == 0.35
-    assert metrics["ode_eval/step"] == 4000
+    assert metrics["ode_eval/step"] == 2000
     assert writer.add_scalar.call_args_list == [
-        mock.call("ode_eval/acc_0", 0.35, 4000),
-        mock.call("ode_eval/block_match_length", 0.6, 4000),
-        mock.call("ode_eval/num_rows", 100.0, 4000),
-        mock.call("ode_eval/step", 4000, 4000),
+        mock.call("ode_eval/acc_0", 0.35, 2000),
+        mock.call("ode_eval/block_match_length", 0.6, 2000),
+        mock.call("ode_eval/num_rows", 100.0, 2000),
+        mock.call("ode_eval/step", 2000, 2000),
     ]
 
 

@@ -21,6 +21,7 @@
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -283,6 +284,16 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
             raise ValueError(
                 f"flowspec_boundary_probability must be in [0, 1), got {boundary_probability}."
             )
+        block_time_max_exponent = getattr(
+            args,
+            "flowspec_block_time_max_exponent",
+            1.0,
+        )
+        if not math.isfinite(block_time_max_exponent) or block_time_max_exponent < 1.0:
+            raise ValueError(
+                "flowspec_block_time_max_exponent must be finite and at least 1, got "
+                f"{block_time_max_exponent}."
+            )
         min_loss = getattr(args, "min_loss_tokens", 0)
         if min_loss < block_size:
             raise ValueError(
@@ -290,9 +301,11 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
                 f"training.flowspec_block_size ({min_loss} < {block_size}). "
                 f"Set dataset.min_loss_tokens={block_size}."
             )
-        if not getattr(args, "store_last_hidden_states", True):
+        if getattr(args, "flowspec_use_target_distribution", False) and not getattr(
+            args, "store_last_hidden_states", True
+        ):
             raise ValueError(
-                "FlowSpec target-agreement metrics require inference.store_last_hidden_states=true."
+                "FlowSpec soft targets require inference.store_last_hidden_states=true."
             )
 
         configured_step_counts = getattr(args, "flowspec_ode_eval_step_counts", None)
