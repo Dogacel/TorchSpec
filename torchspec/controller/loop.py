@@ -33,9 +33,11 @@ from tqdm import tqdm
 from torchspec.controller.eval import (
     generate_eval_cache,
     run_eval,
+    run_flowspec_ode_eval,
     setup_eval,
     update_checkpoint_eval_meta,
 )
+from torchspec.training.checkpoint import _write_checkpoint_metadata
 from torchspec.utils.logging import get_tb_writer, logger
 
 
@@ -148,6 +150,23 @@ def _safe_training_cleanup(
             logger.warning(f"Failed to shutdown mooncake master actor: {exc}")
 
 
+def _maybe_run_initial_eval(args, start_step: int, train_group, eval_enabled: bool) -> dict:
+    if not eval_enabled or not getattr(args, "eval_at_start", False):
+        return {}
+
+    logger.info("Running evaluation before the first training step...")
+    metrics = run_eval(start_step, train_group, eval_enabled)
+    metrics.update(run_flowspec_ode_eval(start_step, train_group, eval_enabled, args))
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir and metrics:
+        output_path = Path(output_dir).expanduser()
+        output_path.mkdir(parents=True, exist_ok=True)
+        metrics_path = output_path / "initial_eval_metrics.json"
+        _write_checkpoint_metadata(metrics_path, metrics)
+        logger.info(f"Saved initial evaluation metrics to {metrics_path}")
+    return metrics
+
+
 def training_loop(
     args,
     controller,
@@ -215,6 +234,8 @@ def training_loop(
     # Resume is best-effort: completed optimizer steps determine epoch/skip, but
     # async prompt/result buffers can still lose or replay a small tail.
     start_step = ray.get(train_group._actor_handlers[0].get_global_step.remote())
+    _maybe_run_initial_eval(args, start_step, train_group, eval_enabled)
+
     resume_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
     resume_skip = (start_step % steps_per_epoch) * args.global_batch_size if start_step > 0 else 0
     ray.get(controller.submit_training_dataset.remote(epoch=resume_epoch, skip=resume_skip))
@@ -360,6 +381,7 @@ def training_loop(
             save_due = _is_save_interval_step(completed_steps, args.save_interval)
             if eval_interval > 0 and completed_steps % eval_interval == 0 and not save_due:
                 run_eval(completed_steps, train_group, eval_enabled)
+                run_flowspec_ode_eval(completed_steps, train_group, eval_enabled, args)
 
             steps_in_current_epoch += 1
             dispatch_attempts = 0
@@ -386,6 +408,9 @@ def training_loop(
                 logger.info(f"Saving checkpoint at step {completed_steps}...")
                 train_group.save_model(completed_steps)
                 last_saved_step = completed_steps
+                eval_metrics.update(
+                    run_flowspec_ode_eval(completed_steps, train_group, eval_enabled, args)
+                )
                 best_eval_score = update_checkpoint_eval_meta(
                     args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
                 )
@@ -414,6 +439,9 @@ def training_loop(
                     )
                     train_group.save_model(completed_steps)
                     last_saved_step = completed_steps
+                    eval_metrics.update(
+                        run_flowspec_ode_eval(completed_steps, train_group, eval_enabled, args)
+                    )
                     best_eval_score = update_checkpoint_eval_meta(
                         args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
                     )
@@ -441,6 +469,7 @@ def training_loop(
         eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
         logger.info(f"Saving final checkpoint at step {completed_steps}...")
         train_group.save_model(completed_steps, force_sync=True)
+        eval_metrics.update(run_flowspec_ode_eval(completed_steps, train_group, eval_enabled, args))
         best_eval_score = update_checkpoint_eval_meta(
             args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
         )

@@ -199,3 +199,7 @@ def _init_wandb_common():
     # Evaluation metrics
     wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric="eval/step")
+
+    # FlowSpec trajectory evaluation
+    wandb.define_metric("ode_eval/step")
+    wandb.define_metric("ode_eval/*", step_metric="ode_eval/step")

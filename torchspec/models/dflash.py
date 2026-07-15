@@ -337,7 +337,7 @@ class DFlashModel(nn.Module):
             count_per_position: [block_size] valid label count at each within-block
                 position before loss decay is applied
             loss_components: dict of extra per-component loss scalars for logging
-                (empty for the base DFlash objective; populated by subclasses).
+                (includes the mean exact-match prefix length for DFlash).
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -461,7 +461,17 @@ class DFlashModel(nn.Module):
                 dim=(0, 1)
             ) / count_per_pos
 
-        loss_components = {}
+            predicted_matches = correct.view(bsz, n_blocks, self.block_size)[..., 1:]
+            predicted_mask = binary_weights[..., 1:] > 0.5
+            prefix_survival = (predicted_matches & predicted_mask).cumprod(dim=-1)
+            valid_blocks = predicted_mask[..., 0]
+            block_match_length = (
+                prefix_survival.sum(dim=-1) * valid_blocks
+            ).sum() / valid_blocks.sum().clamp(min=1)
+
+        loss_components = {
+            "block_match_length": block_match_length.float(),
+        }
         return (
             loss,
             accuracy,

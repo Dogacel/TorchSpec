@@ -240,3 +240,12 @@ class RayTrainGroup:
     def run_eval(self):
         """Run forward-only eval on every actor using the CPU-cached batches."""
         return ray.get([actor.eval_from_cache.remote() for actor in self._actor_handlers])
+
+    def run_flowspec_ode_eval(self, num_steps: int, max_samples: int, seed: int):
+        """Run deterministic FlowSpec ODE eval on every actor's cached shard."""
+        return ray.get(
+            [
+                actor.flowspec_ode_eval_from_cache.remote(num_steps, max_samples, seed)
+                for actor in self._actor_handlers
+            ]
+        )

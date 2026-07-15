@@ -21,6 +21,7 @@
 """DFlash trainer — extends Trainer with DFlash-specific model init, forward, and metrics."""
 
 from argparse import Namespace
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
@@ -50,7 +51,7 @@ class DFlashTrainer(Trainer):
 
     _draft_config_class = DFlashConfig
     _anchor_slot_offset = 1
-    _extra_loss_component_keys: list[str] = []
+    _extra_loss_component_keys: list[str] = ["block_match_length"]
 
     def _build_draft_model(self, config):
         """Instantiate the draft network. Overridden by subclasses."""
@@ -196,7 +197,16 @@ class DFlashTrainer(Trainer):
         if decay_style == "WSD" and total_steps:
             from torchspec.training.lr_scheduler import LRSchedulerWithWarmup
 
-            wsd_ratio = getattr(self.args, "wsd_decay_ratio", 0.2)
+            wsd_ratio = getattr(
+                self.args,
+                "lr_wsd_decay_ratio",
+                getattr(self.args, "wsd_decay_ratio", 0.2),
+            )
+            wsd_decay_style = (
+                getattr(self.args, "lr_wsd_decay_style", None)
+                or getattr(self.args, "wsd_decay_style", None)
+                or "cosine"
+            )
             self.optimizer.scheduler = LRSchedulerWithWarmup(
                 self.optimizer.optimizer,
                 max_lr=self.args.learning_rate,
@@ -205,7 +215,7 @@ class DFlashTrainer(Trainer):
                 decay_style="WSD",
                 min_lr=getattr(self.args, "min_lr", 0.0),
                 wsd_decay_steps=int(wsd_ratio * total_steps),
-                wsd_decay_style=getattr(self.args, "wsd_decay_style", "cosine"),
+                wsd_decay_style=wsd_decay_style,
             )
 
         self.lr_scheduler = self.optimizer.lr_scheduler
@@ -410,17 +420,32 @@ class DFlashTrainer(Trainer):
 
         self.model.eval()
         all_metrics: list[dict] = []
-        for i in range(0, len(self._eval_cache), eval_mbs):
-            chunk = self._eval_cache[i : i + eval_mbs]
-            batch = self._eval_collator(chunk)
-            gpu_batch = {
-                k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()
-            }
-            all_metrics.append(self.eval_forward(gpu_batch))
-
-        self.model.train()
+        try:
+            with self._isolated_eval_rng():
+                for i in range(0, len(self._eval_cache), eval_mbs):
+                    chunk = self._eval_cache[i : i + eval_mbs]
+                    batch = self._eval_collator(chunk)
+                    gpu_batch = {
+                        k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()
+                    }
+                    all_metrics.append(self.eval_forward(gpu_batch))
+        finally:
+            self.model.train()
 
         return self._aggregate_eval_metrics(all_metrics)
+
+    @contextmanager
+    def _isolated_eval_rng(self):
+        devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=devices):
+            seed = getattr(self.args, "eval_seed", None)
+            if seed is not None:
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                rank_seed = seed + rank
+                torch.random.default_generator.manual_seed(rank_seed)
+                if devices:
+                    torch.cuda.manual_seed(rank_seed)
+            yield
 
     def _aggregate_eval_metrics(self, all_step_metrics: list[dict]) -> dict:
         if not all_step_metrics:

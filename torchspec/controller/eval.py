@@ -31,7 +31,7 @@ import wandb
 from tqdm import tqdm
 
 from torchspec.training.checkpoint import _read_checkpoint_metadata, _write_checkpoint_metadata
-from torchspec.utils.logging import logger
+from torchspec.utils.logging import get_tb_writer, logger
 
 EVAL_CACHE_IDLE_TIMEOUT = 300.0
 
@@ -81,9 +81,14 @@ def update_checkpoint_eval_meta(
         logger.warning(f"Checkpoint meta.json not found at {meta_path}, skipping eval meta update")
         return current_best
 
-    for key in ("eval/avg_loss", "eval/avg_acc", "eval/simulated_acc_len"):
-        if key in eval_metrics:
-            metadata[key] = eval_metrics[key]
+    for key, value in eval_metrics.items():
+        metric_group = key.split("/", 1)[0]
+        if (
+            key not in {"eval/step", "ode_eval/step"}
+            and metric_group in {"eval", "ode_eval"}
+            and isinstance(value, (int, float))
+        ):
+            metadata[key] = value
     _write_checkpoint_metadata(meta_path, metadata)
 
     score = eval_metrics.get("eval/simulated_acc_len")
@@ -150,6 +155,11 @@ def run_eval(step: int, train_group, eval_enabled: bool) -> dict:
         eval_metrics["eval/step"] = step
         if wandb.run is not None:
             wandb.log(eval_metrics)
+        tb_writer = get_tb_writer()
+        if tb_writer is not None:
+            for key, value in eval_metrics.items():
+                if isinstance(value, (int, float)):
+                    tb_writer.add_scalar(key, value, step)
         logger.info(
             f"Step {step} eval: "
             f"loss={eval_metrics.get('eval/avg_loss', 0):.4f}, "
@@ -157,6 +167,68 @@ def run_eval(step: int, train_group, eval_enabled: bool) -> dict:
             f"sim_acc_len={eval_metrics.get('eval/simulated_acc_len', 0):.2f}"
         )
     return eval_metrics
+
+
+def run_flowspec_ode_eval(step: int, train_group, eval_enabled: bool, args) -> dict:
+    """Run the configured FlowSpec trajectory evaluation."""
+    configured_step_counts = getattr(args, "flowspec_ode_eval_step_counts", None)
+    if configured_step_counts is None:
+        num_steps = getattr(args, "flowspec_ode_eval_steps", 0)
+        step_counts = [num_steps] if num_steps > 0 else []
+    else:
+        step_counts = list(configured_step_counts)
+    max_samples = getattr(args, "flowspec_ode_eval_max_samples", 0)
+    if not eval_enabled or not step_counts or max_samples <= 0:
+        return {}
+
+    seed = getattr(args, "flowspec_ode_eval_seed", 1234)
+    combined_metrics = {}
+    multiple_step_counts = len(step_counts) > 1
+    for num_steps in step_counts:
+        logger.info(
+            "Starting FlowSpec ODE eval: steps=%d max_samples=%d seed=%d",
+            num_steps,
+            max_samples,
+            seed,
+        )
+        started_at = time.monotonic()
+        eval_results = train_group.run_flowspec_ode_eval(num_steps, max_samples, seed)
+        metrics = eval_results[0] if eval_results else {}
+        if not metrics:
+            continue
+
+        if multiple_step_counts:
+            logged_metrics = {
+                key.replace("ode_eval/", f"ode_eval/ode{num_steps}/", 1): value
+                for key, value in metrics.items()
+            }
+        else:
+            logged_metrics = metrics
+        combined_metrics.update(logged_metrics)
+
+        logger.info(
+            "Step %d FlowSpec ODE eval (%d steps): acc_0=%.4f, "
+            "block_match_length=%.2f (rows=%d, %.1fs)",
+            step,
+            num_steps,
+            metrics.get("ode_eval/acc_0", 0.0),
+            metrics.get("ode_eval/block_match_length", 0.0),
+            int(metrics.get("ode_eval/num_rows", 0)),
+            time.monotonic() - started_at,
+        )
+
+    if not combined_metrics:
+        return {}
+
+    combined_metrics["ode_eval/step"] = step
+    if wandb.run is not None:
+        wandb.log(combined_metrics)
+    tb_writer = get_tb_writer()
+    if tb_writer is not None:
+        for key, value in combined_metrics.items():
+            if isinstance(value, (int, float)):
+                tb_writer.add_scalar(key, value, step)
+    return combined_metrics
 
 
 def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSetupState:

@@ -259,13 +259,88 @@ def _get_draft_model_config(args):
 
 
 def _validate_and_configure_dflash(args, draft_model_config) -> None:
-    """Validate
-    -specific config and auto-set aux layer IDs.
+    """Validate block-drafter config and auto-set target feature layers.
 
     Called before dataset loading to fail fast on misconfigurations.
     """
     from torchspec.models.draft.dflash import DFlashConfig
     from torchspec.models.draft.dspark import DSparkConfig
+    from torchspec.models.draft.flowspec import FlowSpecConfig
+
+    if isinstance(draft_model_config, FlowSpecConfig):
+        engine_type = getattr(args, "inference_engine_type", "hf")
+        if engine_type not in ("vllm", "sgl", "trtllm", "offline"):
+            raise NotImplementedError(
+                "FlowSpec supports inference_engine_type in "
+                f"('vllm', 'sgl', 'trtllm', 'offline'), got '{engine_type}'."
+            )
+        if getattr(args, "defer_tokenization", False):
+            raise NotImplementedError("FlowSpec does not support defer_tokenization=True.")
+
+        block_size = getattr(args, "flowspec_block_size", 8)
+        boundary_probability = getattr(args, "flowspec_boundary_probability", 0.0)
+        if not 0.0 <= boundary_probability < 1.0:
+            raise ValueError(
+                f"flowspec_boundary_probability must be in [0, 1), got {boundary_probability}."
+            )
+        min_loss = getattr(args, "min_loss_tokens", 0)
+        if min_loss < block_size:
+            raise ValueError(
+                "FlowSpec requires dataset.min_loss_tokens >= "
+                f"training.flowspec_block_size ({min_loss} < {block_size}). "
+                f"Set dataset.min_loss_tokens={block_size}."
+            )
+        if not getattr(args, "store_last_hidden_states", True):
+            raise ValueError(
+                "FlowSpec target-agreement metrics require inference.store_last_hidden_states=true."
+            )
+
+        configured_step_counts = getattr(args, "flowspec_ode_eval_step_counts", None)
+        if configured_step_counts is None:
+            ode_eval_steps = getattr(args, "flowspec_ode_eval_steps", 0)
+            if ode_eval_steps < 0:
+                raise ValueError(
+                    f"flowspec_ode_eval_steps must be non-negative, got {ode_eval_steps}."
+                )
+            ode_eval_step_counts = [ode_eval_steps] if ode_eval_steps > 0 else []
+        else:
+            ode_eval_step_counts = list(configured_step_counts)
+        ode_eval_max_samples = getattr(args, "flowspec_ode_eval_max_samples", 0)
+        if any(step_count <= 0 for step_count in ode_eval_step_counts):
+            raise ValueError(
+                f"FlowSpec ODE evaluation step counts must be positive, got {ode_eval_step_counts}."
+            )
+        if len(set(ode_eval_step_counts)) != len(ode_eval_step_counts):
+            raise ValueError(
+                f"FlowSpec ODE evaluation step counts must be unique, got {ode_eval_step_counts}."
+            )
+        if ode_eval_max_samples < 0:
+            raise ValueError(
+                f"flowspec_ode_eval_max_samples must be non-negative, got {ode_eval_max_samples}."
+            )
+        if bool(ode_eval_step_counts) != (ode_eval_max_samples > 0):
+            raise ValueError(
+                "FlowSpec ODE evaluation requires positive step counts and max samples, "
+                "or both must be disabled."
+            )
+        if getattr(args, "flowspec_ode_eval_seed", 0) < 0:
+            raise ValueError("flowspec_ode_eval_seed must be non-negative.")
+
+        if not getattr(args, "aux_hidden_states_layers", None):
+            from torchspec.models.draft.flowspec import build_target_layer_ids
+
+            target_layer_ids = getattr(draft_model_config, "target_layer_ids", None)
+            if target_layer_ids is None:
+                num_target = getattr(draft_model_config, "num_target_layers", 5)
+                target_num_hidden = getattr(
+                    draft_model_config,
+                    "target_num_hidden_layers",
+                    36,
+                )
+                target_layer_ids = build_target_layer_ids(num_target, target_num_hidden)
+            args.aux_hidden_states_layers = target_layer_ids
+            logger.info(f"FlowSpec: set aux_hidden_states_layers = {target_layer_ids}")
+        return
 
     if not isinstance(draft_model_config, DFlashConfig):
         return
