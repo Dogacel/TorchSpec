@@ -27,7 +27,9 @@ from torchspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
 from torchspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from torchspec.models.draft.dflash2 import DFlash2Config, DFlash2DraftModel
 from torchspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
+from torchspec.models.draft.flowspec import FlowSpecConfig, FlowSpecDraftModel
 from torchspec.models.dspark import DSparkModel
+from torchspec.models.flowspec import FlowSpecModel
 
 __all__ = [
     "Eagle3Model",
@@ -40,6 +42,9 @@ __all__ = [
     "DSparkModel",
     "DSparkConfig",
     "DSparkDraftModel",
+    "FlowSpecModel",
+    "FlowSpecConfig",
+    "FlowSpecDraftModel",
     "AutoDraftModelConfig",
     "AutoEagle3DraftModel",
 ]

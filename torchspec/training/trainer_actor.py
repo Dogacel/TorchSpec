@@ -28,12 +28,17 @@ from torchspec import AutoDraftModelConfig
 from torchspec.models.draft.dflash import DFlashConfig
 from torchspec.models.draft.dflash2 import DFlash2Config
 from torchspec.models.draft.dspark import DSparkConfig
+from torchspec.models.draft.flowspec import FlowSpecConfig
 from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.distributed import init_gloo_group, init_usp_groups
 from torchspec.utils.logging import setup_file_logging
 
 
 def _trainer_class_for_config(draft_model_config):
+    if isinstance(draft_model_config, FlowSpecConfig):
+        from torchspec.training.flowspec_trainer import FlowSpecTrainer
+
+        return FlowSpecTrainer
     if isinstance(draft_model_config, DFlash2Config):
         from torchspec.training.dflash2_trainer import DFlash2Trainer
 
@@ -155,3 +160,14 @@ class TrainerActor(RayActor):
 
     def eval_from_cache(self) -> dict:
         return self._trainer.eval_from_cache()
+
+    def flowspec_ode_eval_from_cache(
+        self,
+        num_steps: int,
+        max_samples: int,
+        seed: int,
+    ) -> dict:
+        evaluator = getattr(self._trainer, "ode_eval_from_cache", None)
+        if evaluator is None:
+            return {}
+        return evaluator(num_steps=num_steps, max_samples=max_samples, seed=seed)

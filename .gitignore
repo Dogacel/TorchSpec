@@ -89,6 +89,7 @@ _tokenspeed/
 wandb/log.txt
 
 .claude/
+.tmp/
 wandb/
 /data/
 profiles/

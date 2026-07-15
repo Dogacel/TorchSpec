@@ -26,6 +26,7 @@ from torchspec.models.eagle3 import (
     compute_lazy_target_padded,
     compute_target_p_padded,
 )
+from torchspec.models.flowspec import FlowSpecModel
 from torchspec.models.ops.loss import compiled_forward_kl_loss
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
@@ -34,6 +35,7 @@ __all__ = [
     "DFlashModel",
     "DFlash2Model",
     "DSparkModel",
+    "FlowSpecModel",
     "compute_lazy_target_padded",
     "compute_target_p_padded",
     "compiled_forward_kl_loss",

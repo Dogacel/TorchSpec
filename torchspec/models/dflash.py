@@ -353,7 +353,7 @@ class DFlashModel(nn.Module):
                 position before loss decay is applied
             loss_components: dict of extra per-component ``(numerator, denominator)``
                 pairs for logging, pooled by the trainer just like ``loss_terms``
-                (empty for the base DFlash objective; populated by subclasses).
+                (includes exact-match prefix length and subclass loss components).
             loss_terms: additive objective numerator and denominator. The trainer
                 pools these over the full accumulation window and data-parallel group.
         """
@@ -483,6 +483,14 @@ class DFlashModel(nn.Module):
                 dim=(0, 1)
             ) / count_per_pos
 
+            predicted_matches = correct.view(bsz, n_blocks, self.block_size)[..., 1:]
+            predicted_mask = binary_weights[..., 1:] > 0.5
+            prefix_survival = (predicted_matches & predicted_mask).cumprod(dim=-1)
+            valid_blocks = predicted_mask[..., 0]
+            block_match_sum = (prefix_survival.sum(dim=-1) * valid_blocks).sum().float()
+            block_count = valid_blocks.sum().float()
+
+        loss_components["block_match_length"] = (block_match_sum, block_count)
         return (
             loss,
             accuracy,

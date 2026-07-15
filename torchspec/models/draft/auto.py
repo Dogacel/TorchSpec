@@ -35,6 +35,7 @@ from torchspec.models.draft.dspark import (
     K3DSparkConfig,
     K3DSparkModel,
 )
+from torchspec.models.draft.flowspec import FlowSpecConfig, FlowSpecDraftModel
 from torchspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 from torchspec.utils.logging import logger
 
@@ -47,6 +48,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         DFlash2Config: DFlash2DraftModel,
         DSparkConfig: DSparkDraftModel,
         K3DSparkConfig: K3DSparkModel,
+        FlowSpecConfig: FlowSpecDraftModel,
     }
 
     @classmethod
@@ -91,6 +93,7 @@ class AutoDraftModelConfig:
         "Qwen3DSparkModel": DSparkConfig,
         "DSparkDraftModel": DSparkConfig,
         "K3DSparkModel": K3DSparkConfig,
+        "FlowSpecDraftModel": FlowSpecConfig,
     }
 
     @classmethod

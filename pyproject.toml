@@ -16,6 +16,7 @@ dependencies = [
     "qwen-vl-utils",
     "psutil",
     "numpy<2.4",
+    "scipy",
     "accelerate",
     "pydantic",
     "openai-harmony",

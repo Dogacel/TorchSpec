@@ -1,0 +1,83 @@
+# One-epoch FlowSpec run with Qwen soft endpoints and tau=0 boundary sampling.
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+  draft_model_config: torchspec/config/flowspec_draft_config.json
+
+dataset:
+  train_data_path: /storage/dogac/TorchSpec/data/perfectblend_50k_qwen3_8b_lowtemp_train.jsonl
+  eval_data_path: /storage/dogac/TorchSpec/data/perfectblend_50k_qwen3_8b_lowtemp_eval.jsonl
+  eval_interval: 1000
+  eval_micro_batch_size: 1
+  chat_template: qwen
+  prompt_key: conversations
+  min_loss_tokens: 8
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 4e-4
+  min_lr: 4e-5
+  weight_decay: 0.01
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 2048
+  num_epochs: 1
+  eval_at_start: true
+  seed: 42
+  training_num_gpus_per_node: 6
+  training_num_nodes: 1
+  fsdp_strategy: REPLICATE
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 4
+  save_interval: 2000
+  save_per_epoch: true
+  max_checkpoints: 3
+  warmup_ratio: 0.01
+
+  flowspec_block_size: 8
+  flowspec_num_anchors: 512
+  flowspec_num_target_layers: 5
+  flowspec_uniform_ce_weight: 0.5
+  flowspec_boundary_probability: 0.03125
+  flowspec_use_target_distribution: true
+  flowspec_ode_eval_max_samples: 100
+  flowspec_ode_eval_seed: 1234
+  flowspec_ode_eval_step_counts: [1, 32]
+  flowspec_ode_eval_steps: 0
+  flowspec_use_time_reparameterization: true
+
+inference:
+  inference_engine_type: sgl
+  store_last_hidden_states: true
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 128
+  inference_buffer_threshold: 64
+  inference_batch_size: 8
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.7
+
+logging:
+  report_to: wandb
+  use_tensorboard: true
+  use_wandb: true
+  wandb_mode: online
+  wandb_project: qwen3-8b-dflash-flow
+  wandb_group: qwen3-8b-flowspec-lowtemp-target-dist-1ep
+  wandb_random_suffix: false
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+
+output_dir: ./outputs/qwen3-8b-flowspec-lowtemp-target-dist-1ep
+cache_dir: ./cache/qwen3-8b-flowspec-lowtemp-target-dist-1ep
