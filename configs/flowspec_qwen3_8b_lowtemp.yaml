@@ -1,4 +1,4 @@
-# One-epoch FlowSpec run with Qwen soft endpoints and tau=0 boundary sampling.
+# Best FlowSpec recipe for from-scratch Qwen3-8B training.
 
 model:
   target_model_path: Qwen/Qwen3-8B
@@ -20,6 +20,9 @@ training:
   draft_accumulation_steps: 1
   learning_rate: 4e-4
   min_lr: 4e-5
+  lr_decay_style: WSD
+  lr_wsd_decay_ratio: 0.2
+  lr_wsd_decay_style: cosine
   weight_decay: 0.01
   max_concurrent_batches: 1
   max_grad_norm: 1.0
@@ -40,8 +43,9 @@ training:
   flowspec_block_size: 8
   flowspec_num_anchors: 512
   flowspec_num_target_layers: 5
-  flowspec_uniform_ce_weight: 0.5
+  flowspec_loss_decay_gamma: 7.0
   flowspec_boundary_probability: 0.03125
+  flowspec_block_time_max_exponent: 1.25
   flowspec_use_target_distribution: true
   flowspec_ode_eval_max_samples: 100
   flowspec_ode_eval_seed: 1234
@@ -68,7 +72,7 @@ logging:
   use_wandb: true
   wandb_mode: online
   wandb_project: qwen3-8b-dflash-flow
-  wandb_group: qwen3-8b-flowspec-lowtemp-target-dist-1ep
+  wandb_group: qwen3-8b-flowspec-lowtemp-gamma7
   wandb_random_suffix: false
 
 mooncake:
@@ -79,5 +83,5 @@ mooncake:
   local_buffer_size: 4GB
   enable_hard_pin: true
 
-output_dir: ./outputs/qwen3-8b-flowspec-lowtemp-target-dist-1ep
-cache_dir: ./cache/qwen3-8b-flowspec-lowtemp-target-dist-1ep
+output_dir: ./outputs/qwen3-8b-flowspec-lowtemp-gamma7
+cache_dir: ./cache/qwen3-8b-flowspec-lowtemp-gamma7

@@ -197,6 +197,7 @@ def run_flowspec_ode_eval(step: int, train_group, eval_enabled: bool, args) -> d
         metrics = eval_results[0] if eval_results else {}
         if not metrics:
             continue
+        step = metrics.pop("ode_eval/step", step)
 
         if multiple_step_counts:
             logged_metrics = {
