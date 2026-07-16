@@ -46,13 +46,29 @@ def _rank_sample_limit(max_samples: int, rank: int, world_size: int) -> int:
     return max_samples // world_size + int(rank < max_samples % world_size)
 
 
+def _acceptance_objective_active(
+    global_step: int,
+    total_steps: int,
+    start_ratio: float | None,
+) -> bool:
+    if start_ratio is None:
+        return False
+    if not 0.0 <= start_ratio <= 1.0:
+        raise ValueError(f"acceptance_start_ratio must be in [0, 1], got {start_ratio}")
+    return global_step >= int(total_steps * start_ratio)
+
+
 class FlowSpecTrainer(DFlashTrainer):
     """Train a dense-vocabulary FLM using cached target-model hidden states."""
 
-    _anchor_slot_offset = 0
+    _anchor_slot_offset = 1
     _extra_loss_component_keys = [
         "block_match_length",
         "objective_loss",
+        "acceptance_stage",
+        "uniform_ce_loss",
+        "acceptance_loss",
+        "soft_acceptance_length",
     ]
 
     def __init__(self, args: Namespace):
@@ -66,6 +82,19 @@ class FlowSpecTrainer(DFlashTrainer):
             True,
         )
         self.loss_decay_gamma = getattr(args, "flowspec_loss_decay_gamma", 7.0)
+        self.uniform_ce_weight = getattr(args, "flowspec_uniform_ce_weight", 0.5)
+        self.acceptance_start_ratio = getattr(
+            args,
+            "flowspec_acceptance_start_ratio",
+            None,
+        )
+        if self.acceptance_start_ratio is not None and not (
+            0.0 <= self.acceptance_start_ratio <= 1.0
+        ):
+            raise ValueError(
+                "flowspec_acceptance_start_ratio must be in [0, 1], got "
+                f"{self.acceptance_start_ratio}"
+            )
         self.boundary_probability = getattr(
             args,
             "flowspec_boundary_probability",
@@ -132,6 +161,7 @@ class FlowSpecTrainer(DFlashTrainer):
             num_anchors=self.num_anchors,
             use_time_reparameterization=self.use_time_reparameterization,
             loss_decay_gamma=self.loss_decay_gamma,
+            uniform_ce_weight=self.uniform_ce_weight,
             boundary_probability=self.boundary_probability,
             block_time_max_exponent=self.block_time_max_exponent,
             use_target_distribution=self.use_target_distribution,
@@ -255,6 +285,11 @@ class FlowSpecTrainer(DFlashTrainer):
             loss_mask=loss_mask,
             lm_head_weight=self.target_lm_head_weight,
             last_hidden_states=last_hidden_states,
+            use_acceptance_objective=_acceptance_objective_active(
+                self.global_step,
+                self.args.lr_total_steps,
+                self.acceptance_start_ratio,
+            ),
         )
 
     def _aggregate_ode_eval_metrics(
@@ -295,6 +330,9 @@ class FlowSpecTrainer(DFlashTrainer):
         count_sum = reduced[offset : 2 * offset]
         prefix_match_sum = reduced[2 * offset : 3 * offset]
         block_match_length_sum, block_count, row_count = reduced[3 * offset :]
+        match_sum = match_sum[self._anchor_slot_offset :]
+        count_sum = count_sum[self._anchor_slot_offset :]
+        prefix_match_sum = prefix_match_sum[self._anchor_slot_offset :]
         accuracy = match_sum / count_sum.clamp(min=1.0)
         prefix_match = prefix_match_sum / block_count.clamp(min=1.0)
         conditional_match = torch.zeros_like(prefix_match)

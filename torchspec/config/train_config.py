@@ -95,6 +95,7 @@ class TrainingConfig:
     attention_backend: str = "sdpa"
     colocate: bool = False
     continual_training: bool = False
+    continual_training_reset_optimizer: bool = True
     distributed_backend: str = "nccl"
     distributed_timeout_minutes: int = 10
     draft_accumulation_steps: int = 1
@@ -142,7 +143,7 @@ class TrainingConfig:
     ploss_weights: Optional[list[float]] = None
     warmup_ratio: float = 0.015
 
-    # WSD LR schedule parameters (used by DFlash trainer only)
+    # WSD LR schedule parameters
     wsd_decay_ratio: float = 0.2
     wsd_decay_style: Optional[str] = None
 
@@ -169,6 +170,8 @@ class TrainingConfig:
     flowspec_num_anchors: int = 512
     flowspec_num_target_layers: int = 5
     flowspec_loss_decay_gamma: float = 7.0
+    flowspec_uniform_ce_weight: float = 0.5
+    flowspec_acceptance_start_ratio: Optional[float] = None
     flowspec_boundary_probability: float = 0.0
     flowspec_block_time_max_exponent: float = 1.0
     flowspec_use_target_distribution: bool = False

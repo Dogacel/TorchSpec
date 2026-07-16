@@ -1,4 +1,4 @@
-# Best FlowSpec recipe for from-scratch Qwen3-8B training.
+# Best aligned FlowSpec recipe for from-scratch Qwen3-8B training.
 
 model:
   target_model_path: Qwen/Qwen3-8B
@@ -44,6 +44,8 @@ training:
   flowspec_num_anchors: 512
   flowspec_num_target_layers: 5
   flowspec_loss_decay_gamma: 7.0
+  flowspec_uniform_ce_weight: 0.5
+  flowspec_acceptance_start_ratio: 0.5
   flowspec_boundary_probability: 0.03125
   flowspec_block_time_max_exponent: 1.25
   flowspec_use_target_distribution: true
@@ -72,7 +74,7 @@ logging:
   use_wandb: true
   wandb_mode: online
   wandb_project: qwen3-8b-dflash-flow
-  wandb_group: qwen3-8b-flowspec-lowtemp-gamma7
+  wandb_group: qwen3-8b-flowspec-lowtemp-aligned-from-scratch
   wandb_random_suffix: false
 
 mooncake:
@@ -83,5 +85,5 @@ mooncake:
   local_buffer_size: 4GB
   enable_hard_pin: true
 
-output_dir: ./outputs/qwen3-8b-flowspec-lowtemp-gamma7
-cache_dir: ./cache/qwen3-8b-flowspec-lowtemp-gamma7
+output_dir: ./outputs/qwen3-8b-flowspec-lowtemp-aligned-from-scratch
+cache_dir: ./cache/qwen3-8b-flowspec-lowtemp-aligned-from-scratch

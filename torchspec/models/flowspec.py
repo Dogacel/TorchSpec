@@ -20,10 +20,10 @@
 
 """Conditional FLM training and sampling for FlowSpec.
 
-An anchor is the last known target-context token.  For block size ``K``, its
-flow state represents tokens ``anchor + 1`` through ``anchor + K``.  Each block
-attends bidirectionally within itself, sees target context through its anchor,
-and cannot see other flow blocks.
+An anchor is the target-generated bonus token at slot 0 of a size-``K`` flow
+block.  The drafter sees target context strictly before the anchor, keeps the
+anchor clean and unscored, and predicts slots 1 through ``K - 1``.  Each block
+attends bidirectionally within itself and cannot see other flow blocks.
 
 FLM uses two time coordinates.  Reparameterized time ``tau`` is sampled and
 given to the denoiser; physical time ``t`` defines the interpolant
@@ -138,7 +138,7 @@ def _create_flowspec_mask_mod(
         anchor = anchor_positions[b, query_block]
 
         is_context = kv_idx < context_len
-        context_visible = is_context & (kv_idx <= anchor)
+        context_visible = is_context & (kv_idx < anchor)
 
         is_draft = kv_idx >= context_len
         key_block = (kv_idx - context_len) // block_size
@@ -184,6 +184,7 @@ class FlowSpecModel(nn.Module):
         num_anchors: int = 512,
         use_time_reparameterization: bool = True,
         loss_decay_gamma: float = 7.0,
+        uniform_ce_weight: float = 0.5,
         boundary_probability: float = 0.0,
         block_time_max_exponent: float = 1.0,
         use_target_distribution: bool = False,
@@ -191,14 +192,16 @@ class FlowSpecModel(nn.Module):
         ode_epsilon: float = 1e-5,
     ):
         super().__init__()
-        if block_size <= 0:
-            raise ValueError(f"block_size must be positive, got {block_size}")
+        if block_size < 2:
+            raise ValueError(f"block_size must be at least 2, got {block_size}")
         if num_anchors <= 0:
             raise ValueError(f"num_anchors must be positive, got {num_anchors}")
         if not math.isfinite(loss_decay_gamma) or loss_decay_gamma <= 0.0:
             raise ValueError(
                 f"loss_decay_gamma must be finite and positive, got {loss_decay_gamma}"
             )
+        if not 0.0 <= uniform_ce_weight <= 1.0:
+            raise ValueError(f"uniform_ce_weight must be in [0, 1], got {uniform_ce_weight}")
         if not 0.0 <= boundary_probability < 1.0:
             raise ValueError(f"boundary_probability must be in [0, 1), got {boundary_probability}")
         if not math.isfinite(block_time_max_exponent) or block_time_max_exponent < 1.0:
@@ -211,8 +214,10 @@ class FlowSpecModel(nn.Module):
 
         self.draft_model = draft_model
         self.block_size = block_size
+        self.num_predictions = block_size - 1
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.uniform_ce_weight = uniform_ce_weight
         self.boundary_probability = boundary_probability
         self.block_time_max_exponent = block_time_max_exponent
         self.use_target_distribution = use_target_distribution
@@ -231,12 +236,20 @@ class FlowSpecModel(nn.Module):
         self.time_of_tau = _TorchCubicSpline(time_of_tau)
         self.register_buffer(
             "block_time_exponents",
-            torch.linspace(1.0, block_time_max_exponent, block_size),
+            torch.cat(
+                [
+                    torch.ones(1),
+                    torch.linspace(1.0, block_time_max_exponent, self.num_predictions),
+                ]
+            ),
             persistent=False,
         )
         self.register_buffer(
             "loss_decay_weights",
-            torch.exp(-torch.arange(block_size, dtype=torch.float32) / loss_decay_gamma),
+            torch.exp(
+                -(torch.arange(block_size, dtype=torch.float32) - 1.0).clamp_min(0.0)
+                / loss_decay_gamma
+            ),
             persistent=False,
         )
 
@@ -250,7 +263,7 @@ class FlowSpecModel(nn.Module):
 
     def _valid_anchor_mask(self, loss_mask: torch.Tensor) -> torch.Tensor:
         sequence_len = loss_mask.shape[1]
-        if sequence_len <= self.block_size:
+        if sequence_len < self.block_size:
             return torch.zeros(
                 loss_mask.shape[0],
                 0,
@@ -258,7 +271,7 @@ class FlowSpecModel(nn.Module):
                 device=loss_mask.device,
             )
         target_windows = loss_mask.unfold(1, self.block_size, 1)
-        return (target_windows[:, 1:] > 0.5).all(dim=-1)
+        return (target_windows > 0.5).all(dim=-1)
 
     def _sample_anchor_positions(
         self,
@@ -313,8 +326,7 @@ class FlowSpecModel(nn.Module):
 
     def _block_token_indices(self, anchor_positions: torch.Tensor) -> torch.Tensor:
         offsets = torch.arange(
-            1,
-            self.block_size + 1,
+            self.block_size,
             device=anchor_positions.device,
         )
         return anchor_positions.unsqueeze(-1) + offsets
@@ -336,9 +348,9 @@ class FlowSpecModel(nn.Module):
         anchor_positions: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, _, hidden_size = last_hidden_states.shape
-        # A causal hidden state at anchor + k predicts token anchor + k + 1.
+        # Hidden state anchor + k predicts scored slot k + 1; slot 0 is known.
         hidden_offsets = torch.arange(
-            self.block_size,
+            self.num_predictions,
             device=anchor_positions.device,
         )
         hidden_indices = anchor_positions.unsqueeze(-1) + hidden_offsets
@@ -452,8 +464,10 @@ class FlowSpecModel(nn.Module):
         return tau
 
     def _expand_block_times(self, block_times: torch.Tensor) -> torch.Tensor:
-        # Every token in a flow block shares its anchor's sampled time.
-        return block_times.unsqueeze(-1).expand(-1, -1, self.block_size).flatten(1)
+        # Slot 0 is a clean anchor; predicted slots share the sampled block time.
+        anchor_time = torch.ones_like(block_times).unsqueeze(-1)
+        prediction_times = block_times.unsqueeze(-1).expand(-1, -1, self.num_predictions)
+        return torch.cat([anchor_time, prediction_times], dim=-1).flatten(1)
 
     def _block_time_coordinates(
         self,
@@ -462,14 +476,26 @@ class FlowSpecModel(nn.Module):
         """Return per-position model time and physical interpolation time."""
 
         if self.block_time_max_exponent == 1.0:
-            token_tau = block_tau.unsqueeze(-1).expand(-1, -1, self.block_size)
-            token_time = self.tau_to_time(block_tau).unsqueeze(-1).expand_as(token_tau)
+            prediction_tau = block_tau.unsqueeze(-1).expand(-1, -1, self.num_predictions)
+            prediction_time = self.tau_to_time(block_tau).unsqueeze(-1).expand_as(prediction_tau)
+            token_tau = torch.cat(
+                [torch.ones_like(block_tau).unsqueeze(-1), prediction_tau], dim=-1
+            )
+            token_time = torch.cat(
+                [torch.ones_like(block_tau).unsqueeze(-1), prediction_time],
+                dim=-1,
+            )
             return token_tau, token_time
 
         # Tau measures denoising difficulty, so a position-dependent power keeps
         # later tokens harder without amplifying the shift through the LUT.
-        token_tau = block_tau.unsqueeze(-1).pow(self.block_time_exponents)
-        token_time = self.tau_to_time(token_tau)
+        prediction_tau = block_tau.unsqueeze(-1).pow(self.block_time_exponents[1:])
+        prediction_time = self.tau_to_time(prediction_tau)
+        token_tau = torch.cat([torch.ones_like(block_tau).unsqueeze(-1), prediction_tau], dim=-1)
+        token_time = torch.cat(
+            [torch.ones_like(block_tau).unsqueeze(-1), prediction_time],
+            dim=-1,
+        )
         return token_tau, token_time
 
     def forward(
@@ -479,6 +505,7 @@ class FlowSpecModel(nn.Module):
         loss_mask: torch.Tensor,
         lm_head_weight: Optional[torch.Tensor] = None,
         last_hidden_states: Optional[torch.Tensor] = None,
+        use_acceptance_objective: bool = False,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -513,13 +540,17 @@ class FlowSpecModel(nn.Module):
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(loss_mask)
         dataset_target_ids = self._gather_block_tokens(input_ids, anchor_positions)
+        hard_target_distribution = F.one_hot(
+            dataset_target_ids,
+            self.draft_model.config.vocab_size,
+        ).float()
         if self.use_target_distribution:
             if lm_head_weight is None or last_hidden_states is None:
                 raise ValueError(
                     "use_target_distribution=True requires lm_head_weight and last_hidden_states"
                 )
             with torch.no_grad():
-                target_distribution = (
+                prediction_distribution = (
                     self._target_logits(
                         last_hidden_states,
                         lm_head_weight,
@@ -528,11 +559,12 @@ class FlowSpecModel(nn.Module):
                     .float()
                     .softmax(dim=-1)
                 )
+                target_distribution = torch.cat(
+                    [hard_target_distribution[:, :, :1], prediction_distribution],
+                    dim=2,
+                )
         else:
-            target_distribution = F.one_hot(
-                dataset_target_ids,
-                self.draft_model.config.vocab_size,
-            ).float()
+            target_distribution = hard_target_distribution
 
         tau = self._sample_training_times(batch_size, input_ids.device)
         token_tau, physical_time = self._block_time_coordinates(tau)
@@ -561,16 +593,46 @@ class FlowSpecModel(nn.Module):
 
         draft_log_probabilities = logits.float().log_softmax(dim=-1).view_as(target_distribution)
         per_token_loss = -(target_distribution * draft_log_probabilities).sum(dim=-1)
-        token_mask = block_keep_mask.unsqueeze(-1).expand_as(per_token_loss).float()
+        prediction_positions = (
+            torch.arange(self.block_size, device=input_ids.device).view(1, 1, -1) > 0
+        )
+        token_mask = (
+            block_keep_mask.unsqueeze(-1).expand_as(per_token_loss) & prediction_positions
+        ).float()
         token_count = token_mask.sum().clamp(min=1.0)
-        position_weights = self.loss_decay_weights.view(1, 1, -1)
-        objective_weights = token_mask * position_weights
-        weighted_token_count = objective_weights.sum().clamp(min=1.0)
+        uniform_ce_loss = (per_token_loss * token_mask).sum() / token_count
 
-        # The previous objective mixed uniform CE with -log(E[L] / N), where
-        # E[L] = sum_j prod_{i<=j} sum_v min(q_i(v), p_i(v)). Gamma-decayed CE
-        # keeps the early-token priority without product-conditioned gradients.
-        loss = (per_token_loss * objective_weights).sum() / weighted_token_count
+        if use_acceptance_objective:
+            # Speculative acceptance at token i is the target/draft probability
+            # overlap. Summing its prefix products gives E[accepted block length].
+            draft_probabilities = draft_log_probabilities.exp()
+            token_acceptance = torch.minimum(
+                target_distribution,
+                draft_probabilities,
+            ).sum(dim=-1)[..., 1:]
+            soft_acceptance_length = token_acceptance.cumprod(dim=-1).sum(dim=-1)
+            valid_block_count = block_keep_mask.sum().clamp(min=1)
+            mean_soft_acceptance = (
+                soft_acceptance_length * block_keep_mask
+            ).sum() / valid_block_count
+            normalized_soft_acceptance = mean_soft_acceptance / self.num_predictions
+            valid_acceptance_loss = -normalized_soft_acceptance.clamp_min(
+                torch.finfo(normalized_soft_acceptance.dtype).tiny
+            ).log()
+            acceptance_loss = torch.where(
+                block_keep_mask.any(),
+                valid_acceptance_loss,
+                uniform_ce_loss,
+            )
+            loss = (
+                self.uniform_ce_weight * uniform_ce_loss
+                + (1.0 - self.uniform_ce_weight) * acceptance_loss / self.num_predictions
+            )
+        else:
+            position_weights = self.loss_decay_weights.view(1, 1, -1)
+            objective_weights = token_mask * position_weights
+            weighted_token_count = objective_weights.sum().clamp(min=1.0)
+            loss = (per_token_loss * objective_weights).sum() / weighted_token_count
 
         loss_components = {}
         with torch.no_grad():
@@ -582,7 +644,7 @@ class FlowSpecModel(nn.Module):
             loss_per_position = (per_token_loss * token_mask).sum(dim=(0, 1)) / safe_count
             accuracy_per_position = correct.sum(dim=(0, 1)) / safe_count
 
-            prefix_survival = correct.bool().cumprod(dim=-1)
+            prefix_survival = correct[..., 1:].bool().cumprod(dim=-1)
             valid_blocks = block_keep_mask.bool()
             block_match_length = (
                 prefix_survival.sum(dim=-1) * valid_blocks
@@ -590,7 +652,16 @@ class FlowSpecModel(nn.Module):
             loss_components = {
                 "block_match_length": block_match_length.float(),
                 "objective_loss": loss.detach(),
+                "acceptance_stage": loss.new_tensor(float(use_acceptance_objective)),
             }
+            if use_acceptance_objective:
+                loss_components.update(
+                    {
+                        "uniform_ce_loss": uniform_ce_loss.detach(),
+                        "acceptance_loss": acceptance_loss.detach(),
+                        "soft_acceptance_length": mean_soft_acceptance.detach(),
+                    }
+                )
 
         return (
             loss,
@@ -606,6 +677,7 @@ class FlowSpecModel(nn.Module):
         self,
         hidden_states_list: List[torch.Tensor],
         anchor_positions: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
         num_steps: int,
         noise: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
@@ -616,6 +688,14 @@ class FlowSpecModel(nn.Module):
         if num_steps <= 0:
             raise ValueError(f"num_steps must be positive, got {num_steps}")
         batch_size, num_anchors = anchor_positions.shape
+        if anchor_token_ids.shape != anchor_positions.shape:
+            raise ValueError(
+                "anchor_token_ids must match anchor_positions, got "
+                f"{tuple(anchor_token_ids.shape)} and {tuple(anchor_positions.shape)}"
+            )
+        vocab_size = self.draft_model.config.vocab_size
+        if bool(((anchor_token_ids < 0) | (anchor_token_ids >= vocab_size)).any()):
+            raise ValueError(f"anchor_token_ids must be in [0, {vocab_size})")
         if block_keep_mask is None:
             block_keep_mask = torch.ones_like(anchor_positions, dtype=torch.bool)
         elif block_keep_mask.shape != anchor_positions.shape:
@@ -639,7 +719,7 @@ class FlowSpecModel(nn.Module):
             batch_size,
             num_anchors,
             self.block_size,
-            self.draft_model.config.vocab_size,
+            vocab_size,
         )
         if noise is None:
             state = torch.randn(
@@ -652,7 +732,8 @@ class FlowSpecModel(nn.Module):
             raise ValueError(f"noise must have shape {expected_shape}, got {tuple(noise.shape)}")
         else:
             state = noise.float()
-        state = state.flatten(1, 2)
+        known_anchor = F.one_hot(anchor_token_ids.long(), vocab_size).float().unsqueeze(2)
+        state = torch.cat([known_anchor, state[:, :, 1:]], dim=2).flatten(1, 2)
 
         tau_grid = torch.linspace(
             0.0,
@@ -674,6 +755,11 @@ class FlowSpecModel(nn.Module):
                 block_mask=attention_mask,
             )
             clean_probabilities = logits.float().softmax(dim=-1)
+            clean_probabilities = clean_probabilities.view(expected_shape)
+            clean_probabilities = torch.cat(
+                [known_anchor, clean_probabilities[:, :, 1:]],
+                dim=2,
+            ).flatten(1, 2)
 
             if step == num_steps - 1:
                 state = clean_probabilities
@@ -691,6 +777,7 @@ class FlowSpecModel(nn.Module):
         self,
         hidden_states_list: List[torch.Tensor],
         anchor_positions: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
         num_steps: int,
         noise: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
@@ -699,6 +786,7 @@ class FlowSpecModel(nn.Module):
         probabilities = self.integrate(
             hidden_states_list=hidden_states_list,
             anchor_positions=anchor_positions,
+            anchor_token_ids=anchor_token_ids,
             num_steps=num_steps,
             noise=noise,
             block_keep_mask=block_keep_mask,
@@ -730,15 +818,23 @@ class FlowSpecModel(nn.Module):
         predictions = self.generate(
             hidden_states_list=hidden_states_list,
             anchor_positions=anchor_positions,
+            anchor_token_ids=target_ids[..., 0],
             num_steps=num_steps,
             block_keep_mask=block_keep_mask,
             generator=generator,
         )
 
-        token_mask = block_keep_mask.unsqueeze(-1).expand_as(predictions)
-        token_matches = predictions.eq(target_ids)
-        prefix_matches = token_matches.cumprod(dim=-1)
-        block_match_length = prefix_matches.sum(dim=-1)
+        prediction_positions = (
+            torch.arange(self.block_size, device=input_ids.device).view(1, 1, -1) > 0
+        )
+        token_mask = block_keep_mask.unsqueeze(-1).expand_as(predictions) & prediction_positions
+        token_matches = predictions.eq(target_ids) & token_mask
+        prediction_prefix_matches = token_matches[..., 1:].cumprod(dim=-1)
+        prefix_matches = torch.cat(
+            [torch.zeros_like(token_matches[..., :1]), prediction_prefix_matches],
+            dim=-1,
+        )
+        block_match_length = prediction_prefix_matches.sum(dim=-1)
         count_per_position = token_mask.sum(dim=(0, 1)).float()
         block_count = block_keep_mask.sum().float()
 

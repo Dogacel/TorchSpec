@@ -185,6 +185,8 @@ def load(actor: Any) -> dict[str, Any] | None:
             logger.info(f"Loaded LR scheduler from {lr_scheduler_dir}")
         except Exception as e:
             logger.warning(f"Failed to load LR scheduler from {lr_scheduler_dir}: {e}")
+    elif continual_training and hasattr(actor, "lr_scheduler"):
+        logger.info("Starting continual training with a fresh LR scheduler.")
     elif hasattr(actor, "lr_scheduler"):
         logger.info(
             f"LR scheduler checkpoint not found at {lr_scheduler_dir}, skipping LR scheduler load."
@@ -205,18 +207,22 @@ def load(actor: Any) -> dict[str, Any] | None:
     }
 
 
-def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
+def _restore_fp32_master_params(
+    actor: Any,
+    optim_dir: Path,
+    *,
+    reset_optimizer: bool = True,
+) -> None:
     """Sync BF16Optimizer's fp32 master params after model-only checkpoint load.
 
     When optimizer state is skipped for continual training, the fp32 master copies
     still hold pre-checkpoint (random init) values.  The first optimizer step
     would copy these back to the model, overwriting the loaded weights.
 
-    Strategy: temporarily load the optimizer checkpoint to recover the fp32 master
-    params, then restore the freshly configured param_groups and clear Adam state
-    so continual training still uses the new optimizer hyperparameters. Falls
-    back to copying from the bf16 model weights if the optimizer checkpoint is
-    unavailable.
+    Load the optimizer checkpoint to recover the fp32 master params, then restore
+    the freshly configured param-group hyperparameters. Adam state is normally
+    cleared for weight-only initialization, but can be retained for a true
+    optimizer continuation with a fresh LR schedule.
     """
     opt = actor.optimizer
     if not hasattr(opt, "fp32_params"):
@@ -236,8 +242,11 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
                 group.clear()
                 group.update(copy.deepcopy(fresh_group))
                 group["params"] = params
-            opt.optimizer.state.clear()
-            logger.info(f"Loaded fp32 master params from {optim_dir}")
+            if reset_optimizer:
+                opt.optimizer.state.clear()
+                logger.info(f"Loaded fp32 master params from {optim_dir}")
+            else:
+                logger.info(f"Loaded optimizer state and fp32 master params from {optim_dir}")
             return
         except Exception as e:
             logger.warning(f"Failed to load fp32 params from optimizer checkpoint: {e}")
@@ -273,7 +282,15 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
             actor.args.start_step = iteration
 
     if continual_training and hasattr(actor, "optimizer"):
-        _restore_fp32_master_params(actor, checkpoint_payload["optimizer_dir"])
+        _restore_fp32_master_params(
+            actor,
+            checkpoint_payload["optimizer_dir"],
+            reset_optimizer=getattr(
+                actor.args,
+                "continual_training_reset_optimizer",
+                True,
+            ),
+        )
 
     torch.cuda.synchronize()
     dist.barrier()
