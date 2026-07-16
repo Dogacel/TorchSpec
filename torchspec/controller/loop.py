@@ -248,6 +248,7 @@ def training_loop(
     )
 
     enable_perf = getattr(args, "enable_perf_metrics", True)
+    prefetch_batches = max(accumulation_steps, getattr(args, "prefetch_depth", 0))
 
     completed_steps = start_step
     current_epoch = completed_steps // steps_per_epoch + 1
@@ -256,23 +257,35 @@ def training_loop(
         logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
     dispatch_attempts = 0
     consecutive_failures = 0
+    queued_batches = 0
     last_saved_step: int | None = None
     progress = tqdm(total=num_steps, desc="Training", unit="step", initial=start_step)
     while completed_steps < num_steps:
-        # Inner loop: dispatch accumulation_steps batches before training
-        dispatches_done = 0
+        remaining_steps = min(
+            num_steps - completed_steps,
+            steps_per_epoch - steps_in_current_epoch,
+        )
+        target_queued_batches = min(
+            prefetch_batches,
+            remaining_steps * accumulation_steps,
+        )
         if enable_perf:
             t_dispatch = time.time()
         status = None
-        while dispatches_done < accumulation_steps:
+        while queued_batches < target_queued_batches:
             dispatch_attempts += 1
 
             dispatched = ray.get(controller.try_dispatch_batch.remote())
             if dispatched:
-                dispatches_done += 1
+                queued_batches += 1
                 consecutive_failures = 0
             else:
                 consecutive_failures += 1
+                if queued_batches >= accumulation_steps:
+                    # Training can proceed while inference refills the sample pool.
+                    target_queued_batches = queued_batches
+                    consecutive_failures = 0
+                    continue
 
                 # Only fetch status when needed for logging or reload decision
                 if dispatch_attempts % 100 == 0 or consecutive_failures >= 500:
@@ -292,7 +305,7 @@ def training_loop(
                     should_reload = True
                 elif (
                     consecutive_failures >= 500
-                    and (completed_steps > 0 or dispatches_done > 0)
+                    and (completed_steps > 0 or queued_batches > 0)
                     and status is not None
                     and status["sample_pool_size"] < status["dispatch_batch_size"]
                     and status.get("prompt_buffer_size", 0) == 0
@@ -301,7 +314,7 @@ def training_loop(
                         f"Pool insufficient for dispatch "
                         f"(pool_size={status['sample_pool_size']}, "
                         f"need={status['dispatch_batch_size']}, "
-                        f"{dispatches_done}/{accumulation_steps} dispatches done, "
+                        f"{queued_batches}/{accumulation_steps} batches queued, "
                         f"{steps_in_current_epoch}/{steps_per_epoch} steps in epoch). "
                         f"Reloading dataset."
                     )
@@ -320,7 +333,7 @@ def training_loop(
 
                 time.sleep(0.01)
         else:
-            # All accumulation dispatches succeeded — run training
+            # The current optimizer step is fully queued.
             if enable_perf:
                 dispatch_wait = time.time() - t_dispatch
 
@@ -333,6 +346,7 @@ def training_loop(
             ]
 
             train_results = ray.get(train_futures)
+            queued_batches -= accumulation_steps
             completed_steps += 1
 
             # Log metrics from training (use rank 0's metrics - they're already all-reduced)

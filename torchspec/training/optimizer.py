@@ -75,8 +75,7 @@ class BF16Optimizer:
                     mp.grad = None
 
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
-        if grad_norm > 0.0:
-            self.optimizer.step()
+        self.optimizer.step()
 
         self.optimizer.zero_grad()
         self.scheduler.step()

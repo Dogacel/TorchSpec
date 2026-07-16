@@ -1,9 +1,4 @@
-# DFlash reproduction config for Qwen3-8B on 4x B200
-#
-# GPU allocation (4x B200):
-#   - 1 GPU for inference (SGLang tp=1)
-#   - 3 GPUs for training (REPLICATE)
-#   - global_batch = micro_batch_size × dp_size × accum = 1 × 3 × 2 = 6
+# Canonical one-epoch DFlash recipe for low-temperature Qwen3-8B data.
 
 model:
   target_model_path: Qwen/Qwen3-8B
@@ -11,29 +6,34 @@ model:
   draft_model_config: torchspec/config/dflash_draft_config.json
 
 dataset:
-  train_data_path: data/perfectblend_800k.jsonl
-  eval_data_path: null
-  eval_interval: 500
+  train_data_path: /storage/dogac/TorchSpec/data/perfectblend_50k_qwen3_8b_lowtemp_train.jsonl
+  eval_data_path: /storage/dogac/TorchSpec/data/perfectblend_50k_qwen3_8b_lowtemp_eval.jsonl
+  eval_interval: 1000
+  eval_micro_batch_size: 1
   chat_template: qwen
   prompt_key: conversations
-  min_loss_tokens: 32
+  min_loss_tokens: 16
 
 training:
   attention_backend: flex_attention
+  eval_seed: 1234
+  eval_at_start: true
   micro_batch_size: 1
   draft_accumulation_steps: 2
   learning_rate: 6e-4
   min_lr: 6e-5
+  lr_decay_style: WSD
+  lr_wsd_decay_ratio: 0.2
+  lr_wsd_decay_style: cosine
   weight_decay: 0.01
   max_concurrent_batches: 1
   max_grad_norm: 1.0
   max_seq_length: 2048
-  num_epochs: 3
+  num_epochs: 1
   seed: 42
-  training_num_gpus_per_node: 3
+  training_num_gpus_per_node: 4
   training_num_nodes: 1
-  ttt_length: 7
-  fsdp_strategy: REPLICATE
+  fsdp_strategy: FULL_SHARD
   fsdp_reduce_dtype: bfloat16
   prefetch_depth: 8
   save_interval: 2000
@@ -41,17 +41,18 @@ training:
   max_checkpoints: 3
   warmup_ratio: 0.04
 
-  dflash_block_size: 16
+  dflash_block_size: 8
   dflash_num_anchors: 512
+  dflash_loss_objective: decay
   dflash_loss_decay_gamma: 7.0
   dflash_num_target_layers: 5
 
 inference:
   inference_engine_type: sgl
   store_last_hidden_states: false
-  inference_num_gpus: 1
+  inference_num_gpus: 4
   inference_num_gpus_per_engine: 1
-  inference_num_gpus_per_node: 4
+  inference_num_gpus_per_node: 8
   max_sample_pool_size: 128
   inference_buffer_threshold: 64
   inference_batch_size: 8
@@ -59,16 +60,24 @@ inference:
     tp_size: 1
     mem_fraction_static: 0.7
 
+logging:
+  report_to: wandb
+  use_tensorboard: true
+  use_wandb: true
+  wandb_mode: online
+  wandb_project: qwen3-8b-dflash-flow
+  wandb_group: qwen3-8b-dflash-lowtemp
+  wandb_random_suffix: false
+
 mooncake:
   master_server_address: null
   metadata_server: null
-  protocol: tcp
+  protocol: rdma
+  device_name: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+  enable_gpu_direct: false
   global_segment_size: 16GB
   local_buffer_size: 4GB
-  # Hard-pin: master-side TTL is disabled; we rely on our explicit
-  # batch_remove(force=True) (see mooncake/eagle_store.py). Requires
-  # mooncake-transfer-engine >= 0.3.10.post1.
   enable_hard_pin: true
 
-output_dir: ./outputs/dflash_repro
-cache_dir: ./cache/dflash_repro
+output_dir: ./outputs/qwen3-8b-dflash-lowtemp
+cache_dir: ./cache/qwen3-8b-dflash-lowtemp

@@ -173,7 +173,7 @@ class TrainingConfig:
     flowspec_uniform_ce_weight: float = 0.5
     flowspec_acceptance_start_ratio: Optional[float] = None
     flowspec_boundary_probability: float = 0.0
-    flowspec_block_time_max_exponent: float = 1.0
+    flowspec_clean_deadline_jitter: float = 0.0
     flowspec_use_target_distribution: bool = False
     flowspec_ode_eval_max_samples: int = 0
     flowspec_ode_eval_seed: int = 1234

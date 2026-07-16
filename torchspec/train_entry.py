@@ -284,15 +284,11 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
             raise ValueError(
                 f"flowspec_boundary_probability must be in [0, 1), got {boundary_probability}."
             )
-        block_time_max_exponent = getattr(
-            args,
-            "flowspec_block_time_max_exponent",
-            1.0,
-        )
-        if not math.isfinite(block_time_max_exponent) or block_time_max_exponent < 1.0:
+        clean_deadline_jitter = getattr(args, "flowspec_clean_deadline_jitter", 0.0)
+        if not math.isfinite(clean_deadline_jitter) or not 0.0 <= clean_deadline_jitter < 1.0:
             raise ValueError(
-                "flowspec_block_time_max_exponent must be finite and at least 1, got "
-                f"{block_time_max_exponent}."
+                "flowspec_clean_deadline_jitter must be finite and in [0, 1), got "
+                f"{clean_deadline_jitter}."
             )
         min_loss = getattr(args, "min_loss_tokens", 0)
         if min_loss < block_size:
