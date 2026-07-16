@@ -34,11 +34,11 @@ training:
   training_num_nodes: 1
   fsdp_strategy: REPLICATE
   fsdp_reduce_dtype: bfloat16
-  prefetch_depth: 4
+  prefetch_depth: 8
   save_interval: 2000
   save_per_epoch: true
   max_checkpoints: 3
-  warmup_ratio: 0.01
+  warmup_ratio: 0.05
 
   flowspec_block_size: 8
   flowspec_num_anchors: 512
@@ -47,7 +47,7 @@ training:
   flowspec_uniform_ce_weight: 0.5
   flowspec_acceptance_start_ratio: 0.5
   flowspec_boundary_probability: 0.03125
-  flowspec_block_time_max_exponent: 1.25
+  flowspec_clean_deadline_jitter: 0.1
   flowspec_use_target_distribution: true
   flowspec_ode_eval_max_samples: 100
   flowspec_ode_eval_seed: 1234
@@ -80,7 +80,9 @@ logging:
 mooncake:
   master_server_address: null
   metadata_server: null
-  protocol: tcp
+  protocol: rdma
+  device_name: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+  enable_gpu_direct: false
   global_segment_size: 16GB
   local_buffer_size: 4GB
   enable_hard_pin: true

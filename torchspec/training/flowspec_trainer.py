@@ -65,7 +65,6 @@ class FlowSpecTrainer(DFlashTrainer):
     _extra_loss_component_keys = [
         "block_match_length",
         "objective_loss",
-        "acceptance_stage",
         "uniform_ce_loss",
         "acceptance_loss",
         "soft_acceptance_length",
@@ -100,11 +99,7 @@ class FlowSpecTrainer(DFlashTrainer):
             "flowspec_boundary_probability",
             0.0,
         )
-        self.block_time_max_exponent = getattr(
-            args,
-            "flowspec_block_time_max_exponent",
-            1.0,
-        )
+        self.clean_deadline_jitter = getattr(args, "flowspec_clean_deadline_jitter", 0.0)
         self.use_target_distribution = getattr(
             args,
             "flowspec_use_target_distribution",
@@ -163,7 +158,7 @@ class FlowSpecTrainer(DFlashTrainer):
             loss_decay_gamma=self.loss_decay_gamma,
             uniform_ce_weight=self.uniform_ce_weight,
             boundary_probability=self.boundary_probability,
-            block_time_max_exponent=self.block_time_max_exponent,
+            clean_deadline_jitter=self.clean_deadline_jitter,
             use_target_distribution=self.use_target_distribution,
             use_flex_attention=getattr(self.args, "attention_backend", "sdpa") == "flex_attention",
         )

@@ -25,7 +25,7 @@ Architecture provenance:
 ======================  ============  ==============================================
 Component               Source        FlowSpec adaptation
 ======================  ============  ==============================================
-Continuous input        FLM           Exact dense vocabulary-to-hidden projection
+Continuous input        FLM           Dense vocabulary-to-hidden projection
 Time embedding          FLM           Sinusoidal biased MLP for packed draft blocks
 Time modulation         FLM DiT       AdaLN-Zero decoder and final-layer modulation
 Context conditioning    DFlash        Projected target hidden states as context KV
@@ -208,8 +208,7 @@ class FlowSpecVocabularyEmbedding(nn.Module):
                 f"{self.weight.shape[0]}"
             )
 
-        projected = torch.matmul(inputs.float(), self.weight.float())
-        return projected.to(inputs.dtype)
+        return torch.matmul(inputs.to(self.weight.dtype), self.weight)
 
 
 class FlowSpecRotaryEmbedding(nn.Module):
