@@ -1,0 +1,55 @@
+# Offline-first TokenSpeed integration smoke/validation config.
+#
+# Materialize:
+#   python -m torchspec.offline.generate \
+#     --config configs/tokenspeed_qwen3_8b.yaml \
+#     --output outputs/tokenspeed-qwen3-8b-offline-1000
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  max_concurrent_batches: 1
+  max_seq_length: 2048
+  num_epochs: 1
+  training_num_gpus_per_node: 1
+  training_num_nodes: 1
+  ttt_length: 7
+
+inference:
+  inference_engine_type: tokenspeed
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  inference_batch_size: 1
+  inference_buffer_threshold: 8
+  max_sample_pool_size: 16
+  store_last_hidden_states: true
+  tokenspeed:
+    tp_size: 1
+    nnodes: 1
+    mem_fraction_static: 0.8
+    init_timeout: 600
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/tokenspeed-qwen3-8b
+cache_dir: ./cache/tokenspeed-qwen3-8b
+model_download_dir: /raid/hf/hub
+
+debug:
+  save_debug_train_data: null

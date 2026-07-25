@@ -103,13 +103,20 @@ micromamba activate torchspec
 # Or install with SGLang
 ./tools/build_conda.sh
 micromamba activate torchspec
+
+# Or install TokenSpeed from an editable source checkout
+./tools/build_conda.sh 1 tokenspeed
+micromamba activate torchspec
 ```
 
 To install into your current environment instead:
 
 ```bash
-./tools/build_conda.sh current sglang  # or 'vllm' or 'both'
+./tools/build_conda.sh current tokenspeed  # or 'sglang', 'vllm', or 'both'
 ```
+
+The TokenSpeed backend currently requires a Python 3.12 environment because
+its native kernel dependency wheels do not support Python 3.14.
 
 Optional: install Flash Attention support:
 
