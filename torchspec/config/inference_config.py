@@ -134,6 +134,21 @@ class TrtllmConfig:
 
 
 @dataclass
+class TokenSpeedConfig:
+    """TokenSpeed offline hidden-state inference configuration.
+
+    The first integration targets single-node eager prefill. Tensor parallelism
+    is derived from ``inference_num_gpus_per_engine``.
+    """
+
+    tp_size: int = 1
+    nnodes: int = 1
+    mem_fraction_static: float = 0.8
+    init_timeout: int = 600
+    extra_args: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class OfflineTrainingConfig:
     """Configuration for training from materialized target outputs."""
 
@@ -160,6 +175,7 @@ class InferenceConfig:
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
     vllm: VllmConfig = field(default_factory=VllmConfig)
     trtllm: TrtllmConfig = field(default_factory=TrtllmConfig)
+    tokenspeed: TokenSpeedConfig = field(default_factory=TokenSpeedConfig)
 
     def resolve_last_hidden_states_prenorm(self) -> bool:
         """Whether last_hidden_states from the engine are pre-norm.

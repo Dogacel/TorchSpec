@@ -46,7 +46,7 @@ def create_inference_engines(args, inference_pg, mooncake_config, engine_group: 
         _wait_for_init(init_refs, "OfflineReplay", timeout=300)
         return engines
 
-    if engine_type not in ("hf", "sgl", "vllm", "trtllm"):
+    if engine_type not in ("hf", "sgl", "vllm", "trtllm", "tokenspeed"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
 
     logger.info(f"Using {engine_type} engine for inference")
@@ -80,7 +80,7 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
     if engine_type == "offline":
         return _prepare_offline_replay_engines(args, mooncake_config, engine_group)
 
-    if engine_type not in ("hf", "sgl", "vllm", "trtllm"):
+    if engine_type not in ("hf", "sgl", "vllm", "trtllm", "tokenspeed"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
 
     logger.info(f"Preparing {engine_type} inference engines...")
@@ -91,6 +91,10 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
         engines, init_refs = _prepare_sgl_engines(args, inference_pg, mooncake_config, engine_group)
     elif engine_type == "trtllm":
         engines, init_refs = _prepare_trtllm_engines(
+            args, inference_pg, mooncake_config, engine_group
+        )
+    elif engine_type == "tokenspeed":
+        engines, init_refs = _prepare_tokenspeed_engines(
             args, inference_pg, mooncake_config, engine_group
         )
     else:
@@ -145,6 +149,8 @@ def init_engines(args, pg, engine_type: str, mooncake_config=None, engine_group:
         return _init_vllm_engines(args, pg, mooncake_config, engine_group)
     elif engine_type == "trtllm":
         return _init_trtllm_engines(args, pg, mooncake_config, engine_group)
+    elif engine_type == "tokenspeed":
+        return _init_tokenspeed_engines(args, pg, mooncake_config, engine_group)
     else:
         raise ValueError(f"Unknown engine_type: {engine_type}")
 
@@ -544,6 +550,68 @@ def _init_trtllm_engines(args, pg, mooncake_config=None, engine_group: int = 0) 
     engines, init_handles = _prepare_trtllm_engines(args, pg, mooncake_config, engine_group)
     init_timeout = getattr(args, "trtllm_init_timeout", 600)
     _wait_for_init(init_handles, "Trtllm", timeout=init_timeout)
+    return engines
+
+
+def _prepare_tokenspeed_engines(
+    args, pg, mooncake_config=None, engine_group: int = 0
+) -> tuple[list, list]:
+    """Create single-node TokenSpeed engine actors."""
+    nnodes = getattr(args, "tokenspeed_nnodes", 1)
+    if nnodes != 1:
+        raise NotImplementedError(
+            "The initial TokenSpeed backend supports single-node inference only"
+        )
+
+    num_gpus_total = getattr(args, "inference_num_gpus", 1)
+    gpus_per_engine = getattr(args, "inference_num_gpus_per_engine", 1)
+    num_engines = num_gpus_total // gpus_per_engine
+    if num_engines <= 0:
+        raise ValueError("TokenSpeed requires at least one inference engine")
+
+    from torchspec.inference.engine.tokenspeed_engine import TokenSpeedEngine
+
+    pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
+    TokenSpeedRayActor = ray.remote(TokenSpeedEngine)
+    env_vars = get_torchspec_env_vars()
+    engines = []
+    for index in range(num_engines):
+        bundle_offset = index * gpus_per_engine
+        base_gpu_id = int(reordered_gpu_ids[bundle_offset])
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=pg_obj,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=reordered_bundle_indices[bundle_offset],
+        )
+        engines.append(
+            TokenSpeedRayActor.options(
+                num_cpus=0.2,
+                num_gpus=0.2,
+                scheduling_strategy=scheduling_strategy,
+                runtime_env={"env_vars": env_vars},
+            ).remote(
+                args=args,
+                rank=index,
+                base_gpu_id=base_gpu_id,
+                num_gpus_per_engine=gpus_per_engine,
+                node_rank=0,
+                engine_group=engine_group,
+            )
+        )
+
+    init_refs = [engine.init.remote(mooncake_config=mooncake_config) for engine in engines]
+    logger.info(
+        "Preparing %d TokenSpeed engine(s), %d GPU(s) each",
+        num_engines,
+        gpus_per_engine,
+    )
+    return engines, init_refs
+
+
+def _init_tokenspeed_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
+    engines, init_refs = _prepare_tokenspeed_engines(args, pg, mooncake_config, engine_group)
+    timeout = getattr(args, "tokenspeed_init_timeout", 600)
+    _wait_for_init(init_refs, "TokenSpeed", timeout=timeout)
     return engines
 
 

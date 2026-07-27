@@ -329,6 +329,7 @@ _PREFIXED_SECTIONS = {
     "sglang": "sglang_",
     "vllm": "vllm_",
     "trtllm": "trtllm_",
+    "tokenspeed": "tokenspeed_",
 }
 
 
