@@ -290,6 +290,42 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
                 "flowspec_clean_deadline_jitter must be finite and in [0, 1), got "
                 f"{clean_deadline_jitter}."
             )
+        use_diffusion_forcing_schedule = getattr(
+            args,
+            "flowspec_use_diffusion_forcing_schedule",
+            True,
+        )
+        if not use_diffusion_forcing_schedule and clean_deadline_jitter != 0.0:
+            raise ValueError(
+                "flowspec_clean_deadline_jitter must be 0 when the regular denoising "
+                "schedule is selected."
+            )
+        time_schedule = getattr(args, "flowspec_time_schedule", "simplex_sharp")
+        from torchspec.models.flowspec_schedule import NOISE_TYPES, TIME_SCHEDULES
+
+        valid_time_schedules = TIME_SCHEDULES
+        if time_schedule not in valid_time_schedules:
+            raise ValueError(
+                "flowspec_time_schedule must be one of "
+                f"{sorted(valid_time_schedules)}, got {time_schedule!r}."
+            )
+        noise_type = getattr(args, "flowspec_noise_type", "simplex")
+        valid_noise_types = NOISE_TYPES
+        if noise_type not in valid_noise_types:
+            raise ValueError(
+                f"flowspec_noise_type must be one of {sorted(valid_noise_types)}, "
+                f"got {noise_type!r}."
+            )
+        self_condition_probability = getattr(
+            args,
+            "flowspec_self_condition_probability",
+            0.0,
+        )
+        if not 0.0 <= self_condition_probability <= 1.0:
+            raise ValueError(
+                "flowspec_self_condition_probability must be in [0, 1], got "
+                f"{self_condition_probability}."
+            )
         min_loss = getattr(args, "min_loss_tokens", 0)
         if min_loss < block_size:
             raise ValueError(
@@ -297,12 +333,8 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
                 f"training.flowspec_block_size ({min_loss} < {block_size}). "
                 f"Set dataset.min_loss_tokens={block_size}."
             )
-        if getattr(args, "flowspec_use_target_distribution", False) and not getattr(
-            args, "store_last_hidden_states", True
-        ):
-            raise ValueError(
-                "FlowSpec soft targets require inference.store_last_hidden_states=true."
-            )
+        if not getattr(args, "store_last_hidden_states", True):
+            raise ValueError("FlowSpec requires inference.store_last_hidden_states=true.")
 
         configured_step_counts = getattr(args, "flowspec_ode_eval_step_counts", None)
         if configured_step_counts is None:
@@ -334,7 +366,6 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
             )
         if getattr(args, "flowspec_ode_eval_seed", 0) < 0:
             raise ValueError("flowspec_ode_eval_seed must be non-negative.")
-
         if not getattr(args, "aux_hidden_states_layers", None):
             from torchspec.models.draft.flowspec import build_target_layer_ids
 

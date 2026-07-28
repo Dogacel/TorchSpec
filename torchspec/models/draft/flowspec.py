@@ -29,6 +29,7 @@ Continuous input        FLM           Dense vocabulary-to-hidden projection
 Time embedding          FLM           Sinusoidal biased MLP for packed draft blocks
 Time modulation         FLM DiT       AdaLN-Zero decoder and final-layer modulation
 Context conditioning    DFlash        Projected target hidden states as context KV
+Self-conditioning       ELF/FMLM      Previous clean estimate concatenated before projection
 Attention               DFlash/Qwen   GQA, Q/K norm, RoPE, and context-plus-draft KV
 MLP and normalization   DFlash/Qwen   SwiGLU and RMSNorm
 Output                  FLM           Time-conditioned, zero-initialized vocab head
@@ -75,6 +76,7 @@ class FlowSpecConfig(PretrainedConfig):
         target_layer_ids: Optional[List[int]] = None,
         output_bias: bool = True,
         tie_word_embeddings: bool = False,
+        self_conditioning: bool = False,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -131,6 +133,7 @@ class FlowSpecConfig(PretrainedConfig):
         self.target_num_hidden_layers = target_num_hidden_layers
         self.target_layer_ids = target_layer_ids
         self.output_bias = output_bias
+        self.self_conditioning = self_conditioning
 
 
 class FlowSpecRMSNorm(nn.Module):
@@ -534,6 +537,14 @@ class FlowSpecDraftModel(PreTrainedModel):
         self.context_norm = FlowSpecRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.vocab_embed = FlowSpecVocabularyEmbedding(config.vocab_size, config.hidden_size)
+        if config.self_conditioning:
+            self.self_condition_proj = nn.Linear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=True,
+            )
+            nn.init.xavier_uniform_(self.self_condition_proj.weight)
+            nn.init.zeros_(self.self_condition_proj.bias)
         self.time_embed = FlowSpecTimestepEmbedding(
             condition_size=config.time_condition_size,
             frequency_size=config.time_frequency_size,
@@ -596,6 +607,7 @@ class FlowSpecDraftModel(PreTrainedModel):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        self_condition_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if flow_state.ndim != 3:
             raise ValueError(f"flow_state must have shape [B, Q, V], got {tuple(flow_state.shape)}")
@@ -625,6 +637,23 @@ class FlowSpecDraftModel(PreTrainedModel):
             )
 
         draft_hidden = self.vocab_embed(flow_state).to(context_feature.dtype)
+        if self.config.self_conditioning:
+            if self_condition_state is None:
+                self_condition_hidden = torch.zeros_like(draft_hidden)
+            else:
+                if self_condition_state.shape != flow_state.shape:
+                    raise ValueError(
+                        "self_condition_state must match flow_state, got "
+                        f"{tuple(self_condition_state.shape)} and {tuple(flow_state.shape)}"
+                    )
+                self_condition_hidden = self.vocab_embed(self_condition_state).to(
+                    draft_hidden.dtype
+                )
+            draft_hidden = self.self_condition_proj(
+                torch.cat([draft_hidden, self_condition_hidden], dim=-1)
+            )
+        elif self_condition_state is not None:
+            raise ValueError("self_condition_state requires config.self_conditioning=true")
         timesteps = timesteps.to(device=flow_state.device)
         time_condition = self._prepare_time_condition(timesteps, batch_size, draft_len).to(
             draft_hidden.dtype

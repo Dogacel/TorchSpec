@@ -170,16 +170,17 @@ class TrainingConfig:
     flowspec_num_anchors: int = 512
     flowspec_num_target_layers: int = 5
     flowspec_loss_decay_gamma: float = 7.0
-    flowspec_uniform_ce_weight: float = 0.5
-    flowspec_acceptance_start_ratio: Optional[float] = None
     flowspec_boundary_probability: float = 0.0
     flowspec_clean_deadline_jitter: float = 0.0
-    flowspec_use_target_distribution: bool = False
+    flowspec_block_schedule_overlap: float = 1.0
+    flowspec_use_diffusion_forcing_schedule: bool = True
+    flowspec_time_schedule: str = "simplex_sharp"
+    flowspec_noise_type: str = "simplex"
+    flowspec_self_condition_probability: float = 0.0
     flowspec_ode_eval_max_samples: int = 0
     flowspec_ode_eval_seed: int = 1234
     flowspec_ode_eval_step_counts: Optional[list[int]] = None
     flowspec_ode_eval_steps: int = 0
-    flowspec_use_time_reparameterization: bool = True
 
 
 @dataclass

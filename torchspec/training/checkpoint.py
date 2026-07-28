@@ -262,8 +262,10 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
         return
 
     continual_training = getattr(actor.args, "continual_training", False)
+    reset_optimizer = getattr(actor.args, "continual_training_reset_optimizer", True)
+    preserve_progress = not continual_training or not reset_optimizer
 
-    if checkpoint_payload.get("rng") is not None and not continual_training:
+    if checkpoint_payload.get("rng") is not None and preserve_progress:
         rng_state = checkpoint_payload["rng"]
         if "torch" in rng_state:
             torch.set_rng_state(rng_state["torch"])
@@ -272,12 +274,12 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
 
     metadata = checkpoint_payload.get("metadata") or {}
     iteration = checkpoint_payload.get("iteration")
-    if metadata and not continual_training:
+    if metadata and preserve_progress:
         actor.global_step = int(metadata.get("global_step", actor.global_step))
         next_step = metadata.get("next_step") or metadata.get("next_inference_id")
         if next_step is not None:
             actor.args.start_step = next_step
-    elif iteration is not None and not continual_training:
+    elif iteration is not None and preserve_progress:
         if getattr(actor.args, "start_step", None) is None:
             actor.args.start_step = iteration
 
@@ -285,11 +287,7 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
         _restore_fp32_master_params(
             actor,
             checkpoint_payload["optimizer_dir"],
-            reset_optimizer=getattr(
-                actor.args,
-                "continual_training_reset_optimizer",
-                True,
-            ),
+            reset_optimizer=reset_optimizer,
         )
 
     torch.cuda.synchronize()

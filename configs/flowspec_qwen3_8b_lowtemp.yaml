@@ -1,4 +1,4 @@
-# Best aligned FlowSpec recipe for from-scratch Qwen3-8B training.
+# From-scratch Qwen3-8B FlowSpec training on the low-temperature 50K data.
 
 model:
   target_model_path: Qwen/Qwen3-8B
@@ -40,20 +40,21 @@ training:
   max_checkpoints: 3
   warmup_ratio: 0.05
 
+  # Slot 0 is the known anchor; slots 1-7 are the scored predictions.
   flowspec_block_size: 8
   flowspec_num_anchors: 512
   flowspec_num_target_layers: 5
   flowspec_loss_decay_gamma: 7.0
-  flowspec_uniform_ce_weight: 0.5
-  flowspec_acceptance_start_ratio: 0.5
   flowspec_boundary_probability: 0.03125
   flowspec_clean_deadline_jitter: 0.1
-  flowspec_use_target_distribution: true
+  flowspec_use_diffusion_forcing_schedule: true
+  flowspec_time_schedule: simplex_sharp
+  flowspec_noise_type: simplex
+  flowspec_self_condition_probability: 0.0
   flowspec_ode_eval_max_samples: 100
   flowspec_ode_eval_seed: 1234
   flowspec_ode_eval_step_counts: [1, 32]
   flowspec_ode_eval_steps: 0
-  flowspec_use_time_reparameterization: true
 
 inference:
   inference_engine_type: sgl
@@ -74,7 +75,7 @@ logging:
   use_wandb: true
   wandb_mode: online
   wandb_project: qwen3-8b-dflash-flow
-  wandb_group: qwen3-8b-flowspec-lowtemp-aligned-from-scratch
+  wandb_group: qwen3-8b-flowspec-lowtemp-simplex-centered-diffusion-block8-1ep
   wandb_random_suffix: false
 
 mooncake:
@@ -87,5 +88,5 @@ mooncake:
   local_buffer_size: 4GB
   enable_hard_pin: true
 
-output_dir: ./outputs/qwen3-8b-flowspec-lowtemp-aligned-from-scratch
-cache_dir: ./cache/qwen3-8b-flowspec-lowtemp-aligned-from-scratch
+output_dir: ./outputs/qwen3-8b-flowspec-lowtemp-simplex-centered-diffusion-block8-1ep
+cache_dir: ./cache/qwen3-8b-flowspec-lowtemp-simplex-centered-diffusion-block8-1ep
