@@ -122,3 +122,35 @@ def test_resume_restores_global_step():
 
     assert actor.global_step == 2000
     assert actor.args.start_step == 2001
+
+
+def test_optimizer_continuation_preserves_global_step_with_fresh_scheduler():
+    actor = SimpleNamespace(
+        args=SimpleNamespace(
+            continual_training=True,
+            continual_training_reset_optimizer=False,
+            start_step=None,
+        ),
+        global_step=0,
+        optimizer=mock.MagicMock(),
+    )
+    payload = {
+        "metadata": {"global_step": 7228, "next_step": 7229},
+        "iteration": 7229,
+        "optimizer_dir": Path("/tmp/fake_optim"),
+    }
+
+    with (
+        mock.patch("torchspec.training.checkpoint._restore_fp32_master_params") as restore,
+        mock.patch("torchspec.training.checkpoint.torch.cuda.synchronize"),
+        mock.patch("torchspec.training.checkpoint.dist.barrier"),
+    ):
+        checkpoint.finalize_load(actor, payload)
+
+    assert actor.global_step == 7228
+    assert actor.args.start_step == 7229
+    restore.assert_called_once_with(
+        actor,
+        Path("/tmp/fake_optim"),
+        reset_optimizer=False,
+    )

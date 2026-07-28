@@ -1,4 +1,4 @@
-# One-epoch FlowSpec recipe for the full PerfectBlend regeneration.
+# Five-epoch FlowSpec recipe for the full PerfectBlend regeneration.
 
 model:
   target_model_path: Qwen/Qwen3-8B
@@ -16,21 +16,21 @@ dataset:
 
 training:
   attention_backend: flex_attention
-  micro_batch_size: 4
+  micro_batch_size: 2
   draft_accumulation_steps: 1
-  learning_rate: 4e-4
-  min_lr: 4e-5
+  learning_rate: 1e-4
+  min_lr: 1e-5
   lr_decay_style: WSD
   lr_wsd_decay_ratio: 0.2
-  lr_wsd_decay_style: cosine
+  lr_wsd_decay_style: linear
   weight_decay: 0.01
   max_concurrent_batches: 1
   max_grad_norm: 1.0
   max_seq_length: 2048
-  num_epochs: 1
+  num_epochs: 5
   eval_at_start: true
   seed: 42
-  training_num_gpus_per_node: 3
+  training_num_gpus_per_node: 6
   training_num_nodes: 1
   fsdp_strategy: REPLICATE
   fsdp_reduce_dtype: bfloat16
@@ -44,23 +44,24 @@ training:
   flowspec_num_anchors: 512
   flowspec_num_target_layers: 5
   flowspec_loss_decay_gamma: 7.0
-  flowspec_uniform_ce_weight: 0.5
-  flowspec_acceptance_start_ratio: 0.5
   flowspec_boundary_probability: 0.03125
-  flowspec_clean_deadline_jitter: 0.1
-  flowspec_use_target_distribution: true
+  flowspec_clean_deadline_jitter: 0.0
+  flowspec_block_schedule_overlap: 2.0
+  flowspec_use_diffusion_forcing_schedule: true
+  flowspec_time_schedule: soft_target_argmax_uniform_blend
+  flowspec_noise_type: standard_gaussian
+  flowspec_self_condition_probability: 0.5
   flowspec_ode_eval_max_samples: 100
   flowspec_ode_eval_seed: 1234
   flowspec_ode_eval_step_counts: [1, 32]
   flowspec_ode_eval_steps: 0
-  flowspec_use_time_reparameterization: true
 
 inference:
   inference_engine_type: sgl
   store_last_hidden_states: true
-  inference_num_gpus: 1
+  inference_num_gpus: 2
   inference_num_gpus_per_engine: 1
-  inference_num_gpus_per_node: 4
+  inference_num_gpus_per_node: 8
   max_sample_pool_size: 128
   inference_buffer_threshold: 64
   inference_batch_size: 8
@@ -74,7 +75,7 @@ logging:
   use_wandb: true
   wandb_mode: online
   wandb_project: qwen3-8b-dflash-flow
-  wandb_group: qwen3-8b-flowspec-full
+  wandb_group: qwen3-8b-flowspec-full-v2
   wandb_random_suffix: false
 
 mooncake:
@@ -87,5 +88,5 @@ mooncake:
   local_buffer_size: 16GB
   enable_hard_pin: true
 
-output_dir: ./outputs/qwen3-8b-flowspec-full
+output_dir: ./outputs/qwen3-8b-flowspec-full-v2
 cache_dir: ./cache/qwen3-8b-flowspec-full

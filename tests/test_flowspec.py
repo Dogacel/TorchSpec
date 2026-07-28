@@ -23,7 +23,6 @@
 import math
 import unittest
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -41,14 +40,15 @@ from torchspec.models.draft.flowspec import (
 )
 from torchspec.models.flowspec import (
     FlowSpecModel,
-    _build_flm_time_schedule,
     _create_flowspec_dense_mask,
     _create_flowspec_mask_mod,
-    _TorchCubicSpline,
+)
+from torchspec.models.flowspec_schedule import (
+    LogitNormalMixtureTimeSchedule,
+    RecognitionTimeSchedule,
 )
 from torchspec.training.flowspec_trainer import (
     FlowSpecTrainer,
-    _acceptance_objective_active,
     _rank_sample_limit,
 )
 
@@ -58,6 +58,7 @@ def _make_config(
     vocab_size: int = 64,
     num_hidden_layers: int = 2,
     num_target_layers: int = 2,
+    self_conditioning: bool = False,
 ) -> FlowSpecConfig:
     return FlowSpecConfig(
         hidden_size=hidden_size,
@@ -76,30 +77,45 @@ def _make_config(
         target_num_hidden_layers=12,
         output_bias=True,
         tie_word_embeddings=False,
+        self_conditioning=self_conditioning,
     )
 
 
 def _make_wrapper(
     block_size: int = 3,
     num_anchors: int = 4,
-    use_time_reparameterization: bool = False,
     boundary_probability: float = 0.0,
     clean_deadline_jitter: float = 0.0,
-    use_target_distribution: bool = False,
-    uniform_ce_weight: float = 0.5,
+    block_schedule_overlap: float = 1.0,
+    use_diffusion_forcing_schedule: bool = True,
+    time_schedule: str = "simplex_sharp",
+    noise_type: str = "simplex",
+    self_condition_probability: float = 0.0,
 ) -> FlowSpecModel:
-    draft_model = FlowSpecDraftModel(_make_config())
+    draft_model = FlowSpecDraftModel(
+        _make_config(self_conditioning=self_condition_probability > 0.0)
+    )
     return FlowSpecModel(
         draft_model=draft_model,
         block_size=block_size,
         num_anchors=num_anchors,
-        use_time_reparameterization=use_time_reparameterization,
         boundary_probability=boundary_probability,
         clean_deadline_jitter=clean_deadline_jitter,
-        use_target_distribution=use_target_distribution,
-        uniform_ce_weight=uniform_ce_weight,
+        block_schedule_overlap=block_schedule_overlap,
+        use_diffusion_forcing_schedule=use_diffusion_forcing_schedule,
+        time_schedule=time_schedule,
+        noise_type=noise_type,
+        self_condition_probability=self_condition_probability,
         use_flex_attention=False,
     )
+
+
+def _target_inputs(model: FlowSpecModel, batch_size: int, sequence_len: int) -> dict:
+    hidden_size = model.draft_model.config.target_hidden_size
+    return {
+        "last_hidden_states": torch.randn(batch_size, sequence_len, hidden_size),
+        "lm_head_weight": torch.randn(model.draft_model.config.vocab_size, hidden_size),
+    }
 
 
 class TestFlowSpecConfig(unittest.TestCase):
@@ -112,6 +128,7 @@ class TestFlowSpecConfig(unittest.TestCase):
         self.assertEqual(restored.vocab_size, config.vocab_size)
         self.assertEqual(restored.time_frequency_size, 16)
         self.assertFalse(restored.tie_word_embeddings)
+        self.assertFalse(restored.self_conditioning)
 
     def test_rejects_invalid_attention_dimensions(self):
         invalid = (
@@ -148,11 +165,13 @@ class TestFlowSpecConfig(unittest.TestCase):
     def test_ode_eval_defaults_are_disabled(self):
         training = Config().training
         self.assertEqual(training.flowspec_loss_decay_gamma, 7.0)
-        self.assertEqual(training.flowspec_uniform_ce_weight, 0.5)
-        self.assertIsNone(training.flowspec_acceptance_start_ratio)
         self.assertEqual(training.flowspec_boundary_probability, 0.0)
         self.assertEqual(training.flowspec_clean_deadline_jitter, 0.0)
-        self.assertFalse(training.flowspec_use_target_distribution)
+        self.assertEqual(training.flowspec_block_schedule_overlap, 1.0)
+        self.assertTrue(training.flowspec_use_diffusion_forcing_schedule)
+        self.assertEqual(training.flowspec_time_schedule, "simplex_sharp")
+        self.assertEqual(training.flowspec_noise_type, "simplex")
+        self.assertEqual(training.flowspec_self_condition_probability, 0.0)
         self.assertEqual(training.flowspec_ode_eval_steps, 0)
         self.assertIsNone(training.flowspec_ode_eval_step_counts)
         self.assertEqual(training.flowspec_ode_eval_max_samples, 0)
@@ -416,26 +435,139 @@ class TestFlowSpecDraftModel(unittest.TestCase):
                 self.draft_len,
             )
 
+    def test_self_conditioning_projection_matches_elf_parameterization(self):
+        config = _make_config(self_conditioning=True)
+        model = FlowSpecDraftModel(config)
+        hidden_size = config.hidden_size
+
+        self.assertEqual(
+            model.self_condition_proj.weight.shape,
+            (hidden_size, 2 * hidden_size),
+        )
+        self.assertIsNotNone(model.self_condition_proj.bias)
+        torch.testing.assert_close(
+            model.self_condition_proj.bias,
+            torch.zeros(hidden_size),
+        )
+        self.assertGreater(
+            model.self_condition_proj.weight[:, :hidden_size].abs().sum().item(),
+            0.0,
+        )
+        self.assertGreater(
+            model.self_condition_proj.weight[:, hidden_size:].abs().sum().item(),
+            0.0,
+        )
+
+        logits = model(
+            flow_state=self.flow_state,
+            self_condition_state=torch.rand_like(self.flow_state),
+            timesteps=torch.rand(self.batch_size, self.draft_len),
+            context_feature=model.extract_context_feature(self.hidden_states),
+            draft_position_ids=self.draft_positions,
+            context_position_ids=self.context_positions,
+            block_mask=self.dense_mask,
+        )
+        self.assertEqual(logits.shape, self.flow_state.shape)
+
 
 class TestFlowSpecWrapper(unittest.TestCase):
+    def test_soft_target_logit_normal_mixture_matches_fitted_quantiles(self):
+        schedule = LogitNormalMixtureTimeSchedule()
+        tau = torch.linspace(0.0, 1.0, 1_001)
+        physical_time = schedule(tau)
+
+        self.assertTrue(bool((physical_time[1:] >= physical_time[:-1]).all()))
+        torch.testing.assert_close(physical_time[[0, -1]], torch.tensor([0.0, 1.0]))
+        torch.testing.assert_close(
+            schedule(torch.tensor([0.1, 0.5, 0.9, 0.95, 0.99])),
+            torch.tensor([0.7699685, 0.8297437, 0.8868507, 0.9104648, 0.9457566]),
+            atol=2e-6,
+            rtol=0.0,
+        )
+
+    def test_soft_target_argmax_uniform_blend_uses_ten_percent_uniform_time(self):
+        model = _make_wrapper(time_schedule="soft_target_argmax_uniform_blend")
+        tau = torch.tensor([0.0, 0.1, 0.5, 0.9, 1.0])
+        base = LogitNormalMixtureTimeSchedule()(tau)
+
+        torch.testing.assert_close(model.tau_to_time(tau), 0.9 * base + 0.1 * tau)
+
+    def test_recognition_schedule_is_monotone_and_matches_landmarks(self):
+        schedule = RecognitionTimeSchedule()
+        tau = torch.linspace(0.0, 1.0, 1_001)
+        physical_time = schedule(tau)
+
+        self.assertTrue(bool((physical_time[1:] >= physical_time[:-1]).all()))
+        torch.testing.assert_close(physical_time[[0, -1]], torch.tensor([0.0, 1.0]))
+        torch.testing.assert_close(
+            schedule(torch.tensor([0.1, 0.5, 0.9])),
+            torch.tensor([0.3999181, 0.5, 0.6000819]),
+            atol=2e-6,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            physical_time + physical_time.flip(0),
+            torch.ones_like(physical_time),
+            atol=2e-5,
+            rtol=0.0,
+        )
+
     def test_default_block_size_is_eight(self):
         draft_model = FlowSpecDraftModel(_make_config())
         model = FlowSpecModel(
             draft_model,
             num_anchors=2,
-            use_time_reparameterization=False,
             use_flex_attention=False,
         )
         self.assertEqual(model.block_size, 8)
         self.assertEqual(model.num_predictions, 7)
         self.assertEqual(FlowSpecTrainer._anchor_slot_offset, 1)
 
+    def test_all_campaign_time_schedules_are_monotone(self):
+        for schedule_name in (
+            "onehot_lut",
+            "simplex_sharp",
+            "simplex_visibility",
+            "affine_balanced",
+            "soft_target_logit_normal_mixture",
+            "soft_target_argmax_uniform_blend",
+            "identity",
+        ):
+            with self.subTest(schedule=schedule_name):
+                model = _make_wrapper(time_schedule=schedule_name)
+                tau = torch.linspace(0.0, 1.0, 1_001)
+                physical_time = model.tau_to_time(tau)
+                self.assertTrue(bool((physical_time[1:] >= physical_time[:-1]).all()))
+                torch.testing.assert_close(
+                    physical_time[[0, -1]],
+                    torch.tensor([0.0, 1.0]),
+                )
+
+    def test_campaign_schedule_shapes_are_distinct(self):
+        signatures = {
+            name: tuple(
+                round(value, 4)
+                for value in _make_wrapper(time_schedule=name)
+                .tau_to_time(torch.tensor([0.25, 0.5, 0.75]))
+                .tolist()
+            )
+            for name in (
+                "onehot_lut",
+                "simplex_sharp",
+                "simplex_visibility",
+                "affine_balanced",
+                "soft_target_logit_normal_mixture",
+                "soft_target_argmax_uniform_blend",
+                "identity",
+            )
+        }
+        self.assertEqual(len(set(signatures.values())), len(signatures))
+
     def test_block_requires_anchor_and_prediction(self):
         with self.assertRaisesRegex(ValueError, "at least 2"):
             FlowSpecModel(
                 FlowSpecDraftModel(_make_config()),
                 block_size=1,
-                use_time_reparameterization=False,
                 use_flex_attention=False,
             )
 
@@ -445,26 +577,8 @@ class TestFlowSpecWrapper(unittest.TestCase):
                 FlowSpecModel(
                     FlowSpecDraftModel(_make_config()),
                     loss_decay_gamma=gamma,
-                    use_time_reparameterization=False,
                     use_flex_attention=False,
                 )
-
-    def test_rejects_invalid_uniform_ce_weight(self):
-        for weight in (-0.1, 1.1):
-            with self.subTest(weight=weight), self.assertRaises(ValueError):
-                FlowSpecModel(
-                    FlowSpecDraftModel(_make_config()),
-                    uniform_ce_weight=weight,
-                    use_time_reparameterization=False,
-                    use_flex_attention=False,
-                )
-
-    def test_two_stage_objective_switches_at_configured_ratio(self):
-        self.assertFalse(_acceptance_objective_active(7_225, 14_452, 0.5))
-        self.assertTrue(_acceptance_objective_active(7_226, 14_452, 0.5))
-        self.assertFalse(_acceptance_objective_active(14_452, 14_452, None))
-        with self.assertRaises(ValueError):
-            _acceptance_objective_active(0, 100, 1.1)
 
     def test_rejects_invalid_boundary_probability(self):
         for probability in (-0.1, 1.0):
@@ -472,7 +586,6 @@ class TestFlowSpecWrapper(unittest.TestCase):
                 FlowSpecModel(
                     FlowSpecDraftModel(_make_config()),
                     boundary_probability=probability,
-                    use_time_reparameterization=False,
                     use_flex_attention=False,
                 )
 
@@ -519,13 +632,10 @@ class TestFlowSpecWrapper(unittest.TestCase):
             torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]),
         )
         torch.testing.assert_close(token_tau[:, -1:, 1:], torch.ones(1, 1, 7))
-        torch.testing.assert_close(physical_time, token_tau)
+        torch.testing.assert_close(physical_time, model.tau_to_time(token_tau))
 
-    def test_block_schedule_applies_lut_after_constructing_token_tau(self):
-        model = _make_wrapper(
-            block_size=8,
-            use_time_reparameterization=True,
-        )
+    def test_block_schedule_maps_token_tau_to_recognition_time(self):
+        model = _make_wrapper(block_size=8)
         tau = torch.tensor([[3.0 / 14.0]])
 
         token_tau, physical_time = model._block_time_coordinates(tau)
@@ -533,6 +643,54 @@ class TestFlowSpecWrapper(unittest.TestCase):
         expected_tau = torch.tensor([[[1.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]]])
         torch.testing.assert_close(token_tau, expected_tau)
         torch.testing.assert_close(physical_time, model.tau_to_time(expected_tau))
+
+    def test_overlap_two_softens_adjacent_block_transitions(self):
+        model = _make_wrapper(block_size=8, block_schedule_overlap=2.0)
+        tau = torch.tensor([[0.2, 0.3]])
+
+        token_tau, physical_time = model._block_time_coordinates(tau)
+
+        torch.testing.assert_close(
+            token_tau[..., 1:],
+            torch.tensor(
+                [
+                    [
+                        [0.8, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [1.0, 0.7, 0.2, 0.0, 0.0, 0.0, 0.0],
+                    ]
+                ]
+            ),
+            atol=1e-6,
+            rtol=0.0,
+        )
+        self.assertTrue(bool((token_tau[..., 1:-1] >= token_tau[..., 2:]).all()))
+        torch.testing.assert_close(physical_time, model.tau_to_time(token_tau))
+
+    def test_overlap_two_schedule_weights_use_overlapping_deadlines(self):
+        model = _make_wrapper(block_size=8, block_schedule_overlap=2.0)
+        active_probability = torch.arange(2, 9, dtype=torch.float32) / 8.0
+
+        torch.testing.assert_close(
+            model.schedule_loss_weights[1:] * active_probability,
+            torch.ones(7),
+        )
+
+    def test_regular_schedule_shares_time_across_predictions(self):
+        model = _make_wrapper(
+            block_size=8,
+            use_diffusion_forcing_schedule=False,
+        )
+        tau = torch.tensor([[0.0, 0.25, 1.0]])
+
+        token_tau, physical_time = model._time_coordinates(tau, training=True)
+
+        torch.testing.assert_close(token_tau[..., 0], torch.ones_like(tau))
+        torch.testing.assert_close(
+            token_tau[..., 1:],
+            tau.unsqueeze(-1).expand(-1, -1, 7),
+        )
+        torch.testing.assert_close(physical_time, model.tau_to_time(token_tau))
+        torch.testing.assert_close(model.schedule_loss_weights, torch.ones(8))
 
     def test_deadline_jitter_is_early_bounded_and_ordered(self):
         model = _make_wrapper(
@@ -554,7 +712,6 @@ class TestFlowSpecWrapper(unittest.TestCase):
     def test_deadline_jitter_changes_training_path_in_tau_space(self):
         model = _make_wrapper(
             block_size=8,
-            use_time_reparameterization=True,
             clean_deadline_jitter=0.1,
         )
         tau = torch.tensor([[0.12, 0.24, 0.36]])
@@ -626,21 +783,6 @@ class TestFlowSpecWrapper(unittest.TestCase):
         torch.testing.assert_close(context_positions, torch.arange(12).unsqueeze(0))
         torch.testing.assert_close(draft_positions, torch.tensor([[1, 2, 3, 5, 6, 7]]))
 
-    def test_corruption_endpoints(self):
-        model = _make_wrapper(block_size=3, num_anchors=2)
-        target_ids = torch.tensor([[[1, 2, 3], [4, 5, 6]]])
-        noise = torch.randn(1, 2, 3, model.draft_model.config.vocab_size)
-        corrupted = model._corrupt_targets(
-            target_ids,
-            physical_time=torch.tensor([[0.0, 1.0]]),
-            noise=noise,
-        )
-        torch.testing.assert_close(corrupted[:, 0], noise[:, 0])
-        torch.testing.assert_close(
-            corrupted[:, 1],
-            F.one_hot(target_ids[:, 1], model.draft_model.config.vocab_size).float(),
-        )
-
     def test_soft_distribution_corruption_endpoints(self):
         model = _make_wrapper(block_size=3, num_anchors=2)
         target = torch.rand(1, 2, 3, model.draft_model.config.vocab_size)
@@ -654,46 +796,130 @@ class TestFlowSpecWrapper(unittest.TestCase):
         torch.testing.assert_close(corrupted[:, 0], noise[:, 0])
         torch.testing.assert_close(corrupted[:, 1], target[:, 1])
 
-    def test_time_splines_are_monotone_and_nonlinear(self):
-        tau_of_time, time_of_tau = _build_flm_time_schedule(
-            vocab_size=64,
+    def test_default_noise_is_a_probability_distribution(self):
+        model = _make_wrapper(block_size=3, num_anchors=2)
+        target = torch.rand(1, 2, 3, model.draft_model.config.vocab_size)
+        target /= target.sum(dim=-1, keepdim=True)
+
+        corrupted = model._corrupt_distribution(
+            target,
+            physical_time=torch.zeros(1, 2),
         )
-        physical_grid = np.linspace(0.0, 1.0, 257)
-        tau_grid = tau_of_time(physical_grid)
-        self.assertAlmostEqual(tau_grid[0], 0.0)
-        self.assertAlmostEqual(tau_grid[-1], 1.0)
-        self.assertTrue(np.all(np.diff(tau_grid) >= -1e-8))
 
-        uniform_tau = np.linspace(0.0, 1.0, 257)
-        mapped_time = time_of_tau(uniform_tau)
-        self.assertAlmostEqual(mapped_time[0], 0.0)
-        self.assertAlmostEqual(mapped_time[-1], 1.0)
-        self.assertTrue(np.all(np.diff(mapped_time) >= -1e-8))
-
-        model = _make_wrapper(use_time_reparameterization=True)
-        physical_time = model.tau_to_time(torch.tensor([0.0, 0.5, 1.0]))
-        torch.testing.assert_close(physical_time[[0, 2]], torch.tensor([0.0, 1.0]))
-        self.assertNotAlmostEqual(physical_time[1].item(), 0.5, places=2)
-
-    def test_torch_spline_matches_scipy_and_is_differentiable(self):
-        _, scipy_inverse = _build_flm_time_schedule(
-            vocab_size=64,
+        self.assertTrue(bool((corrupted >= 0.0).all()))
+        torch.testing.assert_close(
+            corrupted.sum(dim=-1),
+            torch.ones_like(corrupted[..., 0]),
         )
-        torch_inverse = _TorchCubicSpline(scipy_inverse)
-        tau = torch.linspace(0.01, 0.99, 64, requires_grad=True)
-        actual = torch_inverse(tau)
-        expected = torch.from_numpy(scipy_inverse(tau.detach().numpy())).float()
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
-        actual.sum().backward()
-        self.assertIsNotNone(tau.grad)
-        self.assertTrue(bool(torch.isfinite(tau.grad).all()))
+    def test_affine_gaussian_matches_row_sum_and_second_moment(self):
+        model = _make_wrapper(noise_type="affine_gaussian")
+        noise = model._sample_noise(
+            torch.Size((8_192, model.draft_model.config.vocab_size)),
+            torch.device("cpu"),
+            generator=torch.Generator().manual_seed(9),
+        )
 
-    def test_forward_and_inverse_time_luts_round_trip(self):
-        model = _make_wrapper(use_time_reparameterization=True)
-        tau = torch.linspace(0.01, 0.99, 101)
-        reconstructed = model.time_to_tau(model.tau_to_time(tau))
-        torch.testing.assert_close(reconstructed, tau, rtol=2e-3, atol=2e-3)
+        torch.testing.assert_close(
+            noise.sum(dim=-1),
+            torch.ones(noise.shape[0]),
+            atol=2e-6,
+            rtol=0.0,
+        )
+        self.assertAlmostEqual(noise.square().sum(dim=-1).mean().item(), 0.8492, places=2)
+        self.assertTrue(bool((noise < 0.0).any()))
+
+    def test_standard_gaussian_noise_retains_original_recipe(self):
+        model = _make_wrapper(noise_type="standard_gaussian")
+        noise = model._sample_noise(
+            torch.Size((4_096, 64)),
+            torch.device("cpu"),
+            generator=torch.Generator().manual_seed(3),
+        )
+        self.assertAlmostEqual(noise.mean().item(), 0.0, places=2)
+        self.assertAlmostEqual(noise.std().item(), 1.0, places=2)
+
+    def test_self_conditioning_uses_detached_model_prediction(self):
+        model = _make_wrapper(
+            block_size=3,
+            num_anchors=1,
+            self_condition_probability=1.0,
+        )
+        calls = []
+
+        def record_forward(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros(1, 3, model.draft_model.config.vocab_size)
+
+        model.draft_model.forward = record_forward
+        model._sample_training_times = lambda *args, **kwargs: torch.zeros(1, 1)
+        model(
+            input_ids=torch.arange(1, 9).unsqueeze(0),
+            hidden_states_list=[
+                torch.randn(1, 8, model.draft_model.config.target_hidden_size)
+                for _ in range(model.draft_model.config.num_target_layers)
+            ],
+            loss_mask=torch.ones(1, 8),
+            **_target_inputs(model, 1, 8),
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertIsNotNone(calls[0]["self_condition_state"])
+        self.assertIsNotNone(calls[1]["self_condition_state"])
+        self.assertEqual(calls[0]["self_condition_state"].shape, (1, 3, 64))
+        self.assertEqual(calls[1]["self_condition_state"].shape, (1, 3, 64))
+        zero_condition = calls[0]["self_condition_state"].view(1, 1, 3, -1)
+        learned_condition = calls[1]["self_condition_state"].view(1, 1, 3, -1)
+        torch.testing.assert_close(
+            zero_condition[..., 1:, :], torch.zeros_like(zero_condition[..., 1:, :])
+        )
+        torch.testing.assert_close(zero_condition[..., :1, :], learned_condition[..., :1, :])
+        self.assertFalse(calls[1]["self_condition_state"].requires_grad)
+
+    def test_ode_carries_previous_clean_prediction_as_self_condition(self):
+        model = _make_wrapper(
+            block_size=3,
+            num_anchors=1,
+            self_condition_probability=0.5,
+        )
+        calls = []
+
+        def record_forward(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros(1, 3, model.draft_model.config.vocab_size)
+
+        model.draft_model.forward = record_forward
+        hidden_states = [
+            torch.randn(1, 6, model.draft_model.config.target_hidden_size)
+            for _ in range(model.draft_model.config.num_target_layers)
+        ]
+        model.integrate(
+            hidden_states_list=hidden_states,
+            anchor_positions=torch.tensor([[2]]),
+            anchor_token_ids=torch.tensor([[7]]),
+            num_steps=2,
+            noise=torch.zeros(1, 1, 3, model.draft_model.config.vocab_size),
+        )
+
+        self.assertEqual(len(calls), 2)
+        first_condition = calls[0]["self_condition_state"].view(1, 1, 3, -1)
+        second_condition = calls[1]["self_condition_state"].view(1, 1, 3, -1)
+        expected_anchor = F.one_hot(
+            torch.tensor(7),
+            model.draft_model.config.vocab_size,
+        ).float()
+        torch.testing.assert_close(first_condition[0, 0, 0], expected_anchor)
+        torch.testing.assert_close(
+            first_condition[0, 0, 1:], torch.zeros_like(first_condition[0, 0, 1:])
+        )
+        torch.testing.assert_close(second_condition[0, 0, 0], expected_anchor)
+        torch.testing.assert_close(
+            second_condition[0, 0, 1:],
+            torch.full_like(
+                second_condition[0, 0, 1:],
+                1.0 / model.draft_model.config.vocab_size,
+            ),
+        )
 
     def test_forward_masks_anchor_and_scores_seven_predictions(self):
         model = _make_wrapper(block_size=8, num_anchors=2)
@@ -710,10 +936,10 @@ class TestFlowSpecWrapper(unittest.TestCase):
             input_ids=input_ids,
             hidden_states_list=hidden_states,
             loss_mask=loss_mask,
+            **_target_inputs(model, batch_size, sequence_len),
         )
         uniform_ce = math.log(model.draft_model.config.vocab_size)
         self.assertAlmostEqual(loss.item(), uniform_ce, places=5)
-        self.assertAlmostEqual(components["objective_loss"].item(), uniform_ce, places=5)
         self.assertEqual(accuracy.item(), 0.0)
         self.assertEqual(loss_per_position.shape, (8,))
         torch.testing.assert_close(
@@ -750,6 +976,7 @@ class TestFlowSpecWrapper(unittest.TestCase):
             input_ids=input_ids,
             hidden_states_list=hidden_states,
             loss_mask=loss_mask,
+            **_target_inputs(model, 1, 6),
         )
 
         flow_state = captured["flow_state"].view(
@@ -779,6 +1006,7 @@ class TestFlowSpecWrapper(unittest.TestCase):
             input_ids=input_ids,
             hidden_states_list=hidden_states,
             loss_mask=torch.ones_like(input_ids, dtype=torch.float32),
+            **_target_inputs(model, 1, 12),
         )
 
         torch.testing.assert_close(
@@ -790,7 +1018,6 @@ class TestFlowSpecWrapper(unittest.TestCase):
         model = _make_wrapper(
             block_size=8,
             num_anchors=2,
-            use_time_reparameterization=True,
             clean_deadline_jitter=0.1,
         )
         input_ids = torch.arange(1, 21).unsqueeze(0)
@@ -813,6 +1040,7 @@ class TestFlowSpecWrapper(unittest.TestCase):
             input_ids=input_ids,
             hidden_states_list=hidden_states,
             loss_mask=loss_mask,
+            **_target_inputs(model, 1, 20),
         )
 
         token_tau = captured["timesteps"].view(1, 2, 8)
@@ -845,52 +1073,15 @@ class TestFlowSpecWrapper(unittest.TestCase):
             input_ids=input_ids,
             hidden_states_list=hidden_states,
             loss_mask=loss_mask,
+            **_target_inputs(model, 1, 20),
         )
 
         token_tau = captured["timesteps"].view(1, 2, 8)
         deterministic_tau, _ = model._block_time_coordinates(fixed_tau)
         torch.testing.assert_close(token_tau, deterministic_tau)
 
-    def test_acceptance_objective_matches_expected_prefix_formula(self):
-        model = _make_wrapper(block_size=3, num_anchors=2, uniform_ce_weight=0.5)
-        batch_size, sequence_len = 1, 8
-        hidden_states = [
-            torch.randn(
-                batch_size,
-                sequence_len,
-                model.draft_model.config.target_hidden_size,
-            )
-            for _ in range(model.draft_model.config.num_target_layers)
-        ]
-        model._sample_training_times = lambda *args, **kwargs: torch.zeros(1, 2)
-
-        loss, _, _, _, _, components = model(
-            input_ids=torch.arange(1, sequence_len + 1).unsqueeze(0),
-            hidden_states_list=hidden_states,
-            loss_mask=torch.ones(batch_size, sequence_len),
-            use_acceptance_objective=True,
-        )
-
-        vocab_size = model.draft_model.config.vocab_size
-        uniform_ce = math.log(vocab_size)
-        expected_length = sum((1.0 / vocab_size) ** k for k in range(1, 3))
-        acceptance_loss = -math.log((2.0 / vocab_size + (1.0 / vocab_size) ** 2) / 3.0)
-        expected_loss = 0.5 * uniform_ce + 0.5 * acceptance_loss / 2.0
-        self.assertAlmostEqual(loss.item(), expected_loss, places=5)
-        self.assertAlmostEqual(components["uniform_ce_loss"].item(), uniform_ce, places=5)
-        self.assertAlmostEqual(components["acceptance_loss"].item(), acceptance_loss, places=5)
-        self.assertAlmostEqual(
-            components["soft_acceptance_length"].item(),
-            expected_length,
-            places=6,
-        )
-
     def test_forward_can_train_on_qwen_distribution(self):
-        model = _make_wrapper(
-            block_size=3,
-            num_anchors=2,
-            use_target_distribution=True,
-        )
+        model = _make_wrapper(block_size=3, num_anchors=2)
         batch_size, sequence_len = 1, 8
         hidden_size = model.draft_model.config.target_hidden_size
         hidden_states = [
@@ -910,23 +1101,14 @@ class TestFlowSpecWrapper(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(loss)))
         self.assertEqual(accuracy.item(), 0.0)
         self.assertEqual(components["block_match_length"].item(), 0.0)
-        self.assertAlmostEqual(
-            components["objective_loss"].item(),
-            math.log(model.draft_model.config.vocab_size),
-            places=5,
-        )
 
-    def test_target_distribution_requires_target_hidden_states(self):
-        model = _make_wrapper(
-            block_size=3,
-            num_anchors=1,
-            use_target_distribution=True,
-        )
+    def test_forward_requires_target_hidden_states(self):
+        model = _make_wrapper(block_size=3, num_anchors=1)
         hidden_states = [
             torch.randn(1, 6, model.draft_model.config.target_hidden_size)
             for _ in range(model.draft_model.config.num_target_layers)
         ]
-        with self.assertRaisesRegex(ValueError, "use_target_distribution=True"):
+        with self.assertRaisesRegex(ValueError, "requires target LM logits"):
             model(
                 input_ids=torch.arange(6).unsqueeze(0),
                 hidden_states_list=hidden_states,
@@ -950,20 +1132,6 @@ class TestFlowSpecWrapper(unittest.TestCase):
         ).argmax(dim=-1)
 
         torch.testing.assert_close(predictions, torch.tensor([[[2, 3]]]))
-
-    def test_soft_target_inputs_must_be_paired(self):
-        model = _make_wrapper(block_size=3, num_anchors=1)
-        hidden_states = [
-            torch.randn(1, 6, model.draft_model.config.target_hidden_size)
-            for _ in range(model.draft_model.config.num_target_layers)
-        ]
-        with self.assertRaisesRegex(ValueError, "must be provided together"):
-            model(
-                input_ids=torch.arange(6).unsqueeze(0),
-                hidden_states_list=hidden_states,
-                loss_mask=torch.ones(1, 6),
-                last_hidden_states=torch.randn(1, 6, 32),
-            )
 
     def test_integration_returns_clean_probabilities(self):
         model = _make_wrapper(block_size=3, num_anchors=1)

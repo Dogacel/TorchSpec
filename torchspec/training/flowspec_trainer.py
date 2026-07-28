@@ -46,64 +46,36 @@ def _rank_sample_limit(max_samples: int, rank: int, world_size: int) -> int:
     return max_samples // world_size + int(rank < max_samples % world_size)
 
 
-def _acceptance_objective_active(
-    global_step: int,
-    total_steps: int,
-    start_ratio: float | None,
-) -> bool:
-    if start_ratio is None:
-        return False
-    if not 0.0 <= start_ratio <= 1.0:
-        raise ValueError(f"acceptance_start_ratio must be in [0, 1], got {start_ratio}")
-    return global_step >= int(total_steps * start_ratio)
-
-
 class FlowSpecTrainer(DFlashTrainer):
     """Train a dense-vocabulary FLM using cached target-model hidden states."""
 
     _anchor_slot_offset = 1
-    _extra_loss_component_keys = [
-        "block_match_length",
-        "objective_loss",
-        "uniform_ce_loss",
-        "acceptance_loss",
-        "soft_acceptance_length",
-    ]
+    _extra_loss_component_keys = ["block_match_length"]
 
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.block_size = getattr(args, "flowspec_block_size", 8)
         self.num_anchors = getattr(args, "flowspec_num_anchors", 512)
         self.num_target_layers = getattr(args, "flowspec_num_target_layers", 5)
-        self.use_time_reparameterization = getattr(
-            args,
-            "flowspec_use_time_reparameterization",
-            True,
-        )
         self.loss_decay_gamma = getattr(args, "flowspec_loss_decay_gamma", 7.0)
-        self.uniform_ce_weight = getattr(args, "flowspec_uniform_ce_weight", 0.5)
-        self.acceptance_start_ratio = getattr(
-            args,
-            "flowspec_acceptance_start_ratio",
-            None,
-        )
-        if self.acceptance_start_ratio is not None and not (
-            0.0 <= self.acceptance_start_ratio <= 1.0
-        ):
-            raise ValueError(
-                "flowspec_acceptance_start_ratio must be in [0, 1], got "
-                f"{self.acceptance_start_ratio}"
-            )
         self.boundary_probability = getattr(
             args,
             "flowspec_boundary_probability",
             0.0,
         )
         self.clean_deadline_jitter = getattr(args, "flowspec_clean_deadline_jitter", 0.0)
-        self.use_target_distribution = getattr(
+        self.block_schedule_overlap = getattr(args, "flowspec_block_schedule_overlap", 1.0)
+        self.use_diffusion_forcing_schedule = getattr(
             args,
-            "flowspec_use_target_distribution",
-            False,
+            "flowspec_use_diffusion_forcing_schedule",
+            True,
+        )
+        self.time_schedule = getattr(args, "flowspec_time_schedule", "simplex_sharp")
+        self.noise_type = getattr(args, "flowspec_noise_type", "simplex")
+        self.self_condition_probability = getattr(
+            args,
+            "flowspec_self_condition_probability",
+            0.0,
         )
 
     def init_model(
@@ -134,6 +106,7 @@ class FlowSpecTrainer(DFlashTrainer):
                     f"{type(draft_model_config).__name__}. Expected str, dict, or "
                     "FlowSpecConfig."
                 )
+            config.self_conditioning = self.self_condition_probability > 0.0
 
             if config.num_target_layers != self.num_target_layers:
                 raise ValueError(
@@ -154,12 +127,14 @@ class FlowSpecTrainer(DFlashTrainer):
             draft_model=draft_model,
             block_size=self.block_size,
             num_anchors=self.num_anchors,
-            use_time_reparameterization=self.use_time_reparameterization,
             loss_decay_gamma=self.loss_decay_gamma,
-            uniform_ce_weight=self.uniform_ce_weight,
             boundary_probability=self.boundary_probability,
             clean_deadline_jitter=self.clean_deadline_jitter,
-            use_target_distribution=self.use_target_distribution,
+            block_schedule_overlap=self.block_schedule_overlap,
+            use_diffusion_forcing_schedule=self.use_diffusion_forcing_schedule,
+            time_schedule=self.time_schedule,
+            noise_type=self.noise_type,
+            self_condition_probability=self.self_condition_probability,
             use_flex_attention=getattr(self.args, "attention_backend", "sdpa") == "flex_attention",
         )
         full_state = flowspec_model.state_dict() if dist.get_rank() == 0 else {}
@@ -229,12 +204,10 @@ class FlowSpecTrainer(DFlashTrainer):
         checkpoint_payload = checkpoint.load(self)
         checkpoint.finalize_load(self, checkpoint_payload)
 
-        self.target_lm_head_weight = None
-        if self.use_target_distribution:
-            self._init_target_lm_head(target_model_path)
-            if self.target_lm_head is None:
-                raise ValueError("Failed to initialize the target LM head.")
-            self.target_lm_head_weight = self.target_lm_head.lm_head.weight
+        self._init_target_lm_head(target_model_path)
+        if self.target_lm_head is None:
+            raise ValueError("Failed to initialize the target LM head.")
+        self.target_lm_head_weight = self.target_lm_head.lm_head.weight
 
         self.prof.on_init_end()
         logger.info(f"[Rank {self.dp_rank}] FlowSpec model initialized with FSDP2")
@@ -262,15 +235,12 @@ class FlowSpecTrainer(DFlashTrainer):
             loss_mask = loss_mask.squeeze(-1)
         loss_mask = loss_mask.to(device, non_blocking=True)
 
-        last_hidden_states = None
-        if self.use_target_distribution:
-            last_hidden_states = batch.get("last_hidden_states")
-            if last_hidden_states is None:
-                raise ValueError(
-                    "FlowSpec soft targets require last_hidden_states. "
-                    "Set inference.store_last_hidden_states=true."
-                )
-            last_hidden_states = last_hidden_states.to(device, non_blocking=True)
+        last_hidden_states = batch.get("last_hidden_states")
+        if last_hidden_states is None:
+            raise ValueError(
+                "FlowSpec requires last_hidden_states. Set inference.store_last_hidden_states=true."
+            )
+        last_hidden_states = last_hidden_states.to(device, non_blocking=True)
 
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
@@ -280,11 +250,6 @@ class FlowSpecTrainer(DFlashTrainer):
             loss_mask=loss_mask,
             lm_head_weight=self.target_lm_head_weight,
             last_hidden_states=last_hidden_states,
-            use_acceptance_objective=_acceptance_objective_active(
-                self.global_step,
-                self.args.lr_total_steps,
-                self.acceptance_start_ratio,
-            ),
         )
 
     def _aggregate_ode_eval_metrics(

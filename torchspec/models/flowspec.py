@@ -25,102 +25,28 @@ block.  The drafter sees target context strictly before the anchor, keeps the
 anchor clean and unscored, and predicts slots 1 through ``K - 1``.  Each block
 attends bidirectionally within itself and cannot see other flow blocks.
 
-FLM uses two time coordinates.  Reparameterized time ``tau`` is sampled and
+FLM uses two time coordinates. Reparameterized time ``tau`` is sampled and
 given to the denoiser; physical time ``t`` defines the interpolant
-``x_t = (1 - t) * noise + t * clean``. ``clean`` can be a one-hot dataset
-token or the target LM's probability vector. The decoding-error schedule maps
-between the two time coordinates for both training and Euler integration.
+``x_t = (1 - t) * noise + t * clean``. The clean state contains target-model
+token probabilities. The corresponding error schedule maps between the two
+coordinates for training and Euler integration.
 """
 
 import math
 from typing import List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.interpolate import CubicSpline
-from scipy.special import log_ndtr
 
 from torchspec.models.draft.flowspec import FlowSpecDraftModel
+from torchspec.models.flowspec_schedule import (
+    NOISE_TYPES,
+    TIME_SCHEDULES,
+    make_time_schedule,
+    sample_noise,
+)
 from torchspec.models.ops.flex_attention import compile_friendly_create_block_mask
-
-
-def _build_flm_time_schedule(
-    vocab_size: int,
-    num_points: int = 1_000,
-    quadrature_points: int = 100,
-) -> Tuple[CubicSpline, CubicSpline]:
-    """Build cubic-spline LUTs for ``tau(t)`` and its inverse ``t(tau)``."""
-
-    if vocab_size <= 1:
-        raise ValueError(f"vocab_size must be greater than 1, got {vocab_size}")
-    if num_points < 2:
-        raise ValueError(f"num_points must be at least 2, got {num_points}")
-    if quadrature_points < 1:
-        raise ValueError(f"quadrature_points must be positive, got {quadrature_points}")
-
-    # Gauss-Hermite nodes approximate the expectation over the clean
-    # vocabulary coordinate's Gaussian noise without Monte Carlo sampling.
-    nodes, weights = np.polynomial.hermite.hermgauss(quadrature_points)
-    nodes = nodes * math.sqrt(2.0)
-    weights = weights / math.sqrt(math.pi)
-
-    physical_time = np.linspace(0.0, 1.0, num_points)
-    noise_scale = np.maximum(1.0 - physical_time, 1e-12)
-    standardized_signal = physical_time / noise_scale
-
-    # Given clean-coordinate noise z, Phi(z + t/(1-t)) is the probability that
-    # one wrong vocabulary coordinate is smaller than the clean coordinate;
-    # log space avoids underflow when this probability is raised to V-1.
-    log_cdf = log_ndtr(standardized_signal[:, None] + nodes[None, :])
-
-    # All V-1 wrong coordinates must be smaller; integrating Phi(...)**(V-1)
-    # over z gives the probability that argmax recovers the clean token.
-    correct_probability = np.sum(
-        weights[None, :] * np.exp((vocab_size - 1) * log_cdf),
-        axis=-1,
-    )
-
-    # Normalize chance accuracy (1/V) to tau=0 and perfect accuracy to tau=1.
-    tau = vocab_size / (vocab_size - 1.0) * (correct_probability - 1.0 / vocab_size)
-    tau = tau + (physical_time - 1.0) * 1e-10
-    tau = np.maximum.accumulate(np.clip(tau, 0.0, 1.0))
-    tau[0] = 0.0
-    tau[-1] = 1.0
-
-    tau_of_time = CubicSpline(physical_time, tau)
-
-    # The inverse spline needs unique, increasing tau knots in flat regions.
-    unique_tau, unique_indices = np.unique(tau, return_index=True)
-    unique_time = physical_time[unique_indices]
-    unique_time[0] = 0.0
-    unique_time[-1] = 1.0
-    time_of_tau = CubicSpline(unique_tau, unique_time)
-    return tau_of_time, time_of_tau
-
-
-class _TorchCubicSpline(nn.Module):
-    """Evaluate a SciPy cubic spline from Torch buffers on the input device."""
-
-    def __init__(self, spline: CubicSpline):
-        super().__init__()
-        self.register_buffer("knots", torch.from_numpy(spline.x))
-        self.register_buffer("coefficients", torch.from_numpy(spline.c))
-
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
-        input_dtype = values.dtype
-        flat_values = values.double().clamp(self.knots[0], self.knots[-1]).reshape(-1)
-        intervals = torch.searchsorted(self.knots, flat_values, right=True) - 1
-        intervals = intervals.clamp(0, self.knots.numel() - 2)
-        offset = flat_values - self.knots[intervals]
-        coefficients = self.coefficients[:, intervals]
-
-        # SciPy stores c0*dx^3 + c1*dx^2 + c2*dx + c3 per knot interval.
-        result = (
-            (coefficients[0] * offset + coefficients[1]) * offset + coefficients[2]
-        ) * offset + coefficients[3]
-        return result.clamp(0.0, 1.0).reshape(values.shape).to(input_dtype)
 
 
 def _create_flowspec_mask_mod(
@@ -182,12 +108,14 @@ class FlowSpecModel(nn.Module):
         draft_model: FlowSpecDraftModel,
         block_size: int = 8,
         num_anchors: int = 512,
-        use_time_reparameterization: bool = True,
         loss_decay_gamma: float = 7.0,
-        uniform_ce_weight: float = 0.5,
         boundary_probability: float = 0.0,
         clean_deadline_jitter: float = 0.0,
-        use_target_distribution: bool = False,
+        block_schedule_overlap: float = 1.0,
+        use_diffusion_forcing_schedule: bool = True,
+        time_schedule: str = "simplex_sharp",
+        noise_type: str = "simplex",
+        self_condition_probability: float = 0.0,
         use_flex_attention: bool = True,
         ode_epsilon: float = 1e-5,
     ):
@@ -200,44 +128,55 @@ class FlowSpecModel(nn.Module):
             raise ValueError(
                 f"loss_decay_gamma must be finite and positive, got {loss_decay_gamma}"
             )
-        if not 0.0 <= uniform_ce_weight <= 1.0:
-            raise ValueError(f"uniform_ce_weight must be in [0, 1], got {uniform_ce_weight}")
         if not 0.0 <= boundary_probability < 1.0:
             raise ValueError(f"boundary_probability must be in [0, 1), got {boundary_probability}")
         if not math.isfinite(clean_deadline_jitter) or not 0.0 <= clean_deadline_jitter < 1.0:
             raise ValueError(
                 f"clean_deadline_jitter must be finite and in [0, 1), got {clean_deadline_jitter}"
             )
+        if not math.isfinite(block_schedule_overlap) or block_schedule_overlap < 1.0:
+            raise ValueError(
+                "block_schedule_overlap must be finite and at least 1, got "
+                f"{block_schedule_overlap}"
+            )
         if ode_epsilon <= 0:
             raise ValueError(f"ode_epsilon must be positive, got {ode_epsilon}")
-
+        if time_schedule not in TIME_SCHEDULES:
+            raise ValueError(
+                f"time_schedule must be one of {sorted(TIME_SCHEDULES)}, got {time_schedule!r}"
+            )
+        if noise_type not in NOISE_TYPES:
+            raise ValueError(f"noise_type must be one of {sorted(NOISE_TYPES)}, got {noise_type!r}")
+        if not 0.0 <= self_condition_probability <= 1.0:
+            raise ValueError(
+                f"self_condition_probability must be in [0, 1], got {self_condition_probability}"
+            )
+        if (self_condition_probability > 0.0) != draft_model.config.self_conditioning:
+            raise ValueError(
+                "draft-model self_conditioning must match whether "
+                "self_condition_probability is positive"
+            )
         self.draft_model = draft_model
         self.block_size = block_size
         self.num_predictions = block_size - 1
         self.num_anchors = num_anchors
-        self.loss_decay_gamma = loss_decay_gamma
-        self.uniform_ce_weight = uniform_ce_weight
         self.boundary_probability = boundary_probability
         self.clean_deadline_jitter = clean_deadline_jitter
-        self.use_target_distribution = use_target_distribution
+        self.block_schedule_overlap = block_schedule_overlap
+        self.use_diffusion_forcing_schedule = use_diffusion_forcing_schedule
+        self.time_schedule = time_schedule
+        self.noise_type = noise_type
+        self.self_condition_probability = self_condition_probability
         self.use_flex_attention = use_flex_attention
         self.ode_epsilon = ode_epsilon
-
-        if use_time_reparameterization:
-            # This analytic schedule assumes one-hot endpoints. It remains an
-            # approximation when target-distribution endpoints are enabled.
-            tau_of_time, time_of_tau = _build_flm_time_schedule(draft_model.config.vocab_size)
-        else:
-            identity = np.array([0.0, 1.0])
-            tau_of_time = CubicSpline(identity, identity)
-            time_of_tau = CubicSpline(identity, identity)
-        self.tau_of_time = _TorchCubicSpline(tau_of_time)
-        self.time_of_tau = _TorchCubicSpline(time_of_tau)
-        self.register_buffer(
-            "clean_deadlines",
-            torch.arange(1, block_size, dtype=torch.float32) / self.num_predictions,
-            persistent=False,
-        )
+        self.time_from_tau = make_time_schedule(time_schedule, draft_model.config.vocab_size)
+        window_stride = 1.0 / (self.num_predictions - 1 + block_schedule_overlap)
+        clean_starts = torch.arange(self.num_predictions, dtype=torch.float32) * window_stride
+        clean_deadlines = clean_starts + block_schedule_overlap * window_stride
+        clean_deadlines[-1] = 1.0
+        self.block_schedule_stride = window_stride
+        self.register_buffer("clean_starts", clean_starts, persistent=False)
+        self.register_buffer("clean_deadlines", clean_deadlines, persistent=False)
         self.register_buffer(
             "loss_decay_weights",
             torch.exp(
@@ -246,26 +185,32 @@ class FlowSpecModel(nn.Module):
             ),
             persistent=False,
         )
-        expected_deadlines = (
-            torch.arange(1, block_size, dtype=torch.float32) - clean_deadline_jitter / 2.0
-        ) / self.num_predictions
-        active_probability = (
-            boundary_probability + (1.0 - boundary_probability) * expected_deadlines
-        )
-        # Correct nested window exposure before applying an intentional position objective.
+        if use_diffusion_forcing_schedule:
+            expected_deadlines = clean_deadlines - clean_deadline_jitter * window_stride / 2.0
+            active_probability = (
+                boundary_probability + (1.0 - boundary_probability) * expected_deadlines
+            )
+            # Correct nested window exposure before applying the position objective.
+            schedule_loss_weights = torch.cat([torch.ones(1), active_probability.reciprocal()])
+        else:
+            schedule_loss_weights = torch.ones(block_size, dtype=torch.float32)
         self.register_buffer(
             "schedule_loss_weights",
-            torch.cat([torch.ones(1), active_probability.reciprocal()]),
+            schedule_loss_weights,
             persistent=False,
         )
 
-    def tau_to_time(self, tau: torch.Tensor) -> torch.Tensor:
-        # Evaluate the precomputed inverse LUT instead of the vocabulary CDF.
-        return self.time_of_tau(tau)
+    def _sample_noise(
+        self,
+        shape: torch.Size | Tuple[int, ...],
+        device: torch.device,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        return sample_noise(self.noise_type, shape, device, generator=generator)
 
-    def time_to_tau(self, physical_time: torch.Tensor) -> torch.Tensor:
-        # The forward LUT is useful for schedule inspection and inverse checks.
-        return self.tau_of_time(physical_time)
+    def tau_to_time(self, tau: torch.Tensor) -> torch.Tensor:
+        # Uniform tau is mapped through the fitted recognition-time distribution.
+        return self.time_from_tau(tau)
 
     def _valid_anchor_mask(self, loss_mask: torch.Tensor) -> torch.Tensor:
         sequence_len = loss_mask.shape[1]
@@ -419,15 +364,6 @@ class FlowSpecModel(nn.Module):
             self.block_size,
         )
 
-    def _corrupt_targets(
-        self,
-        target_ids: torch.Tensor,
-        physical_time: torch.Tensor,
-        noise: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        target = F.one_hot(target_ids, self.draft_model.config.vocab_size).float()
-        return self._corrupt_distribution(target, physical_time, noise)
-
     def _corrupt_distribution(
         self,
         target: torch.Tensor,
@@ -435,7 +371,7 @@ class FlowSpecModel(nn.Module):
         noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if noise is None:
-            noise = torch.randn_like(target, dtype=torch.float32)
+            noise = self._sample_noise(target.shape, target.device)
         elif noise.shape != target.shape:
             raise ValueError(
                 f"noise must have shape {tuple(target.shape)}, got {tuple(noise.shape)}"
@@ -448,7 +384,9 @@ class FlowSpecModel(nn.Module):
                 f"{tuple(physical_time.shape)} and {tuple(target.shape)}"
             )
         time = physical_time.unsqueeze(-1).float()
-        return (1.0 - time) * noise.float() + time * target.float()
+        target = target.float()
+        noise = noise.float()
+        return (1.0 - time) * noise + time * target
 
     def _sample_training_times(
         self,
@@ -484,11 +422,8 @@ class FlowSpecModel(nn.Module):
                 f"{(*block_tau.shape, self.num_predictions)}, got {tuple(clean_deadlines.shape)}"
             )
 
-        starts = torch.cat(
-            [torch.zeros_like(clean_deadlines[..., :1]), clean_deadlines[..., :-1]],
-            dim=-1,
-        )
-        # Token i denoises only between the preceding and its own i / K deadline.
+        starts = self.clean_starts.expand_as(clean_deadlines)
+        # Ordered overlapping windows expose a cleaner prefix and noisier suffix.
         prediction_tau = ((block_tau.unsqueeze(-1) - starts) / (clean_deadlines - starts)).clamp(
             0.0,
             1.0,
@@ -508,6 +443,16 @@ class FlowSpecModel(nn.Module):
         token_time = self.tau_to_time(token_tau)
         return token_tau, token_time
 
+    def _regular_time_coordinates(
+        self,
+        block_tau: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Use one shared denoising time for every prediction in a block."""
+
+        prediction_tau = block_tau.unsqueeze(-1).expand(*block_tau.shape, self.num_predictions)
+        token_tau = torch.cat([torch.ones_like(block_tau).unsqueeze(-1), prediction_tau], dim=-1)
+        return token_tau, self.tau_to_time(token_tau)
+
     def _sample_clean_deadlines(
         self,
         block_tau: torch.Tensor,
@@ -517,15 +462,15 @@ class FlowSpecModel(nn.Module):
         if self.clean_deadline_jitter == 0.0:
             return deadlines
 
-        # Move every deadline earlier by less than one base interval. Independent
-        # offsets therefore preserve d_1 < ... < d_K and the i / K cap.
+        # Move every deadline earlier by less than one window stride. Independent
+        # offsets therefore preserve the ordering of the clean deadlines.
         offsets = torch.rand(
             deadlines.shape,
             device=block_tau.device,
             dtype=block_tau.dtype,
             generator=generator,
         )
-        return deadlines - offsets * (self.clean_deadline_jitter / self.num_predictions)
+        return deadlines - offsets * (self.clean_deadline_jitter * self.block_schedule_stride)
 
     def _sample_training_time_coordinates(
         self,
@@ -535,6 +480,18 @@ class FlowSpecModel(nn.Module):
         deadlines = self._sample_clean_deadlines(block_tau, generator=generator)
         return self._block_time_coordinates(block_tau, clean_deadlines=deadlines)
 
+    def _time_coordinates(
+        self,
+        block_tau: torch.Tensor,
+        training: bool = False,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_diffusion_forcing_schedule:
+            return self._regular_time_coordinates(block_tau)
+        if training:
+            return self._sample_training_time_coordinates(block_tau, generator=generator)
+        return self._block_time_coordinates(block_tau)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -542,7 +499,6 @@ class FlowSpecModel(nn.Module):
         loss_mask: torch.Tensor,
         lm_head_weight: Optional[torch.Tensor] = None,
         last_hidden_states: Optional[torch.Tensor] = None,
-        use_acceptance_objective: bool = False,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -556,22 +512,21 @@ class FlowSpecModel(nn.Module):
                 "input_ids and loss_mask must both have shape [B, S], got "
                 f"{tuple(input_ids.shape)} and {tuple(loss_mask.shape)}"
             )
-        if (lm_head_weight is None) != (last_hidden_states is None):
-            raise ValueError("lm_head_weight and last_hidden_states must be provided together")
-        if last_hidden_states is not None:
-            if last_hidden_states.shape[:2] != input_ids.shape:
-                raise ValueError(
-                    "last_hidden_states must have shape [B, S, D] matching input_ids, got "
-                    f"{tuple(last_hidden_states.shape)} and {tuple(input_ids.shape)}"
-                )
-            if lm_head_weight.ndim != 2 or lm_head_weight.shape != (
-                self.draft_model.config.vocab_size,
-                last_hidden_states.shape[-1],
-            ):
-                raise ValueError(
-                    "lm_head_weight must have shape [V, D] matching the draft vocabulary and "
-                    f"target hidden size, got {tuple(lm_head_weight.shape)}"
-                )
+        if lm_head_weight is None or last_hidden_states is None:
+            raise ValueError("FlowSpec requires target LM logits for its clean probability state")
+        if last_hidden_states.shape[:2] != input_ids.shape:
+            raise ValueError(
+                "last_hidden_states must have shape [B, S, D] matching input_ids, got "
+                f"{tuple(last_hidden_states.shape)} and {tuple(input_ids.shape)}"
+            )
+        if lm_head_weight.ndim != 2 or lm_head_weight.shape != (
+            self.draft_model.config.vocab_size,
+            last_hidden_states.shape[-1],
+        ):
+            raise ValueError(
+                "lm_head_weight must have shape [V, D] matching the draft vocabulary and "
+                f"target hidden size, got {tuple(lm_head_weight.shape)}"
+            )
 
         batch_size, context_len = input_ids.shape
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
@@ -581,37 +536,31 @@ class FlowSpecModel(nn.Module):
             dataset_target_ids,
             self.draft_model.config.vocab_size,
         ).float()
-        if self.use_target_distribution:
-            if lm_head_weight is None or last_hidden_states is None:
-                raise ValueError(
-                    "use_target_distribution=True requires lm_head_weight and last_hidden_states"
+        with torch.no_grad():
+            prediction_distribution = (
+                self._target_logits(
+                    last_hidden_states,
+                    lm_head_weight,
+                    anchor_positions,
                 )
-            with torch.no_grad():
-                prediction_distribution = (
-                    self._target_logits(
-                        last_hidden_states,
-                        lm_head_weight,
-                        anchor_positions,
-                    )
-                    .float()
-                    .softmax(dim=-1)
-                )
-                target_distribution = torch.cat(
-                    [hard_target_distribution[:, :, :1], prediction_distribution],
-                    dim=2,
-                )
-        else:
-            target_distribution = hard_target_distribution
+                .float()
+                .softmax(dim=-1)
+            )
+            target_distribution = torch.cat(
+                [hard_target_distribution[:, :, :1], prediction_distribution],
+                dim=2,
+            )
 
         tau = self._sample_training_times(batch_size, input_ids.device)
-        if self.training:
-            token_tau, physical_time = self._sample_training_time_coordinates(tau)
-        else:
-            token_tau, physical_time = self._block_time_coordinates(tau)
+        token_tau, physical_time = self._time_coordinates(
+            tau,
+            training=self.training,
+        )
         flow_state = self._corrupt_distribution(
             target_distribution,
             physical_time,
-        ).flatten(1, 2)
+        )
+        flow_state = flow_state.flatten(1, 2)
         model_times = token_tau.flatten(1, 2)
 
         context_positions, draft_positions = self._create_position_ids(
@@ -622,6 +571,41 @@ class FlowSpecModel(nn.Module):
             block_keep_mask,
             context_len,
         )
+        self_condition_state = None
+        if self.self_condition_probability > 0.0:
+            zero_self_condition = torch.cat(
+                [
+                    hard_target_distribution[:, :, :1],
+                    torch.zeros_like(target_distribution[:, :, 1:]),
+                ],
+                dim=2,
+            )
+            with torch.no_grad():
+                initial_logits = self.draft_model(
+                    flow_state=flow_state,
+                    timesteps=model_times,
+                    context_feature=context_feature,
+                    draft_position_ids=draft_positions,
+                    context_position_ids=context_positions,
+                    block_mask=attention_mask,
+                    self_condition_state=zero_self_condition.flatten(1, 2),
+                )
+                predicted_clean = (
+                    initial_logits.float().softmax(dim=-1).view_as(target_distribution)
+                )
+                predicted_clean = torch.cat(
+                    [hard_target_distribution[:, :, :1], predicted_clean[:, :, 1:]],
+                    dim=2,
+                )
+                use_self_condition = (
+                    torch.rand(batch_size, device=input_ids.device)
+                    < self.self_condition_probability
+                ).view(batch_size, 1, 1, 1)
+                self_condition_state = torch.where(
+                    use_self_condition,
+                    predicted_clean,
+                    zero_self_condition,
+                ).flatten(1, 2)
         logits = self.draft_model(
             flow_state=flow_state,
             timesteps=model_times,
@@ -629,6 +613,7 @@ class FlowSpecModel(nn.Module):
             draft_position_ids=draft_positions,
             context_position_ids=context_positions,
             block_mask=attention_mask,
+            self_condition_state=self_condition_state,
         )
 
         draft_log_probabilities = logits.float().log_softmax(dim=-1).view_as(target_distribution)
@@ -644,56 +629,17 @@ class FlowSpecModel(nn.Module):
         token_count = token_mask.sum().clamp(min=1.0)
         schedule_weights = self.schedule_loss_weights.view(1, 1, -1)
         corrected_token_weights = token_mask * schedule_weights
-        corrected_token_count = corrected_token_weights.sum().clamp(min=1.0)
-        uniform_ce_loss = (per_token_loss * corrected_token_weights).sum() / corrected_token_count
-
-        if use_acceptance_objective:
-            # Speculative acceptance at token i is the target/draft probability
-            # overlap. Summing its prefix products gives E[accepted block length].
-            draft_probabilities = draft_log_probabilities.exp()
-            token_acceptance = torch.minimum(
-                target_distribution,
-                draft_probabilities,
-            ).sum(dim=-1)[..., 1:]
-            active_predictions = token_mask[..., 1:].bool()
-            active_acceptance = torch.where(
-                active_predictions,
-                token_acceptance,
-                torch.ones_like(token_acceptance),
-            )
-            prefix_acceptance = active_acceptance.cumprod(dim=-1)
-            soft_acceptance_length = (prefix_acceptance * active_predictions).sum(dim=-1)
-            valid_blocks = block_keep_mask & active_predictions.any(dim=-1)
-            valid_block_count = valid_blocks.sum().clamp(min=1)
-            mean_soft_acceptance = (soft_acceptance_length * valid_blocks).sum() / valid_block_count
-            prediction_schedule_weights = schedule_weights[..., 1:]
-            acceptance_weights = (
-                active_predictions * prediction_schedule_weights * valid_blocks.unsqueeze(-1)
-            )
-            normalized_soft_acceptance = (
-                prefix_acceptance * acceptance_weights
-            ).sum() / acceptance_weights.sum().clamp(min=1.0)
-            valid_acceptance_loss = -normalized_soft_acceptance.clamp_min(
-                torch.finfo(normalized_soft_acceptance.dtype).tiny
-            ).log()
-            acceptance_loss = torch.where(
-                valid_blocks.any(),
-                valid_acceptance_loss,
-                uniform_ce_loss,
-            )
-            loss = (
-                self.uniform_ce_weight * uniform_ce_loss
-                + (1.0 - self.uniform_ce_weight) * acceptance_loss / self.num_predictions
-            )
-        else:
-            position_weights = self.loss_decay_weights.view(1, 1, -1)
-            objective_weights = corrected_token_weights * position_weights
-            weighted_token_count = objective_weights.sum().clamp(min=1.0)
-            loss = (per_token_loss * objective_weights).sum() / weighted_token_count
+        # Earlier experiments directly optimized differentiable prefix acceptance;
+        # this baseline uses the standard DFlash-style gamma-decayed token CE.
+        position_weights = self.loss_decay_weights.view(1, 1, -1)
+        objective_weights = corrected_token_weights * position_weights
+        weighted_token_count = objective_weights.sum().clamp(min=1.0)
+        loss = (per_token_loss * objective_weights).sum() / weighted_token_count
 
         loss_components = {}
         with torch.no_grad():
-            predictions = logits.argmax(dim=-1).view(batch_size, self.num_anchors, self.block_size)
+            flat_predictions = logits.argmax(dim=-1)
+            predictions = flat_predictions.view(batch_size, self.num_anchors, self.block_size)
             matches = predictions == dataset_target_ids
             correct = matches.float() * token_mask
             accuracy = correct.sum() / token_count
@@ -717,17 +663,7 @@ class FlowSpecModel(nn.Module):
             ).sum() / valid_blocks.sum().clamp(min=1)
             loss_components = {
                 "block_match_length": block_match_length.float(),
-                "objective_loss": loss.detach(),
             }
-            if use_acceptance_objective:
-                loss_components.update(
-                    {
-                        "uniform_ce_loss": uniform_ce_loss.detach(),
-                        "acceptance_loss": acceptance_loss.detach(),
-                        "soft_acceptance_length": mean_soft_acceptance.detach(),
-                    }
-                )
-
         return (
             loss,
             accuracy,
@@ -748,7 +684,7 @@ class FlowSpecModel(nn.Module):
         block_keep_mask: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        """Integrate FLM and return ``[B, N, K, V]`` clean-token probabilities."""
+        """Integrate FLM and return ``[B, N, K, V]`` clean vocabulary states."""
 
         if num_steps <= 0:
             raise ValueError(f"num_steps must be positive, got {num_steps}")
@@ -787,10 +723,9 @@ class FlowSpecModel(nn.Module):
             vocab_size,
         )
         if noise is None:
-            state = torch.randn(
+            state = self._sample_noise(
                 expected_shape,
-                device=anchor_positions.device,
-                dtype=torch.float32,
+                anchor_positions.device,
                 generator=generator,
             )
         elif noise.shape != expected_shape:
@@ -799,6 +734,24 @@ class FlowSpecModel(nn.Module):
             state = noise.float()
         known_anchor = F.one_hot(anchor_token_ids.long(), vocab_size).float().unsqueeze(2)
         state = torch.cat([known_anchor, state[:, :, 1:]], dim=2).flatten(1, 2)
+        self_condition_state = (
+            torch.cat(
+                [
+                    known_anchor,
+                    torch.zeros(
+                        batch_size,
+                        num_anchors,
+                        self.num_predictions,
+                        vocab_size,
+                        device=state.device,
+                        dtype=state.dtype,
+                    ),
+                ],
+                dim=2,
+            ).flatten(1, 2)
+            if self.self_condition_probability > 0.0
+            else None
+        )
 
         tau_grid = torch.linspace(
             0.0,
@@ -809,8 +762,8 @@ class FlowSpecModel(nn.Module):
         for step in range(num_steps):
             tau_current = tau_grid[step].expand(batch_size, num_anchors)
             tau_next = tau_grid[step + 1].expand(batch_size, num_anchors)
-            token_tau_current, time_current = self._block_time_coordinates(tau_current)
-            token_tau_next, time_next = self._block_time_coordinates(tau_next)
+            token_tau_current, time_current = self._time_coordinates(tau_current)
+            token_tau_next, time_next = self._time_coordinates(tau_next)
             logits = self.draft_model(
                 flow_state=state,
                 timesteps=token_tau_current.flatten(1, 2),
@@ -818,22 +771,25 @@ class FlowSpecModel(nn.Module):
                 draft_position_ids=draft_positions,
                 context_position_ids=context_positions,
                 block_mask=attention_mask,
+                self_condition_state=self_condition_state,
             )
-            clean_probabilities = logits.float().softmax(dim=-1)
-            clean_probabilities = clean_probabilities.view(expected_shape)
-            clean_probabilities = torch.cat(
-                [known_anchor, clean_probabilities[:, :, 1:]],
+            clean_state = logits.float().softmax(dim=-1)
+            clean_state = clean_state.view(expected_shape)
+            clean_state = torch.cat(
+                [known_anchor, clean_state[:, :, 1:]],
                 dim=2,
             ).flatten(1, 2)
+            if self.self_condition_probability > 0.0:
+                self_condition_state = clean_state
 
             current = time_current.flatten(1, 2).unsqueeze(-1)
             delta = (time_next - time_current).flatten(1, 2).unsqueeze(-1)
-            velocity = (clean_probabilities - state) / (1.0 - current + self.ode_epsilon)
+            velocity = (clean_state - state) / (1.0 - current + self.ode_epsilon)
             updated_state = state + delta * velocity
             newly_clean = (
                 ((token_tau_current < 1.0) & (token_tau_next >= 1.0)).flatten(1, 2).unsqueeze(-1)
             )
-            state = torch.where(newly_clean, clean_probabilities, updated_state)
+            state = torch.where(newly_clean, clean_state, updated_state)
 
         return state.view(expected_shape)
 
@@ -848,7 +804,7 @@ class FlowSpecModel(nn.Module):
         block_keep_mask: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        probabilities = self.integrate(
+        state = self.integrate(
             hidden_states_list=hidden_states_list,
             anchor_positions=anchor_positions,
             anchor_token_ids=anchor_token_ids,
@@ -857,7 +813,7 @@ class FlowSpecModel(nn.Module):
             block_keep_mask=block_keep_mask,
             generator=generator,
         )
-        return probabilities.argmax(dim=-1)
+        return state.argmax(dim=-1)
 
     @torch.no_grad()
     def evaluate_integrated(
@@ -888,7 +844,6 @@ class FlowSpecModel(nn.Module):
             block_keep_mask=block_keep_mask,
             generator=generator,
         )
-
         prediction_positions = (
             torch.arange(self.block_size, device=input_ids.device).view(1, 1, -1) > 0
         )
