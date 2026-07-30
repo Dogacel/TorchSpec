@@ -168,6 +168,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         cache_keys: Optional[torch.Tensor] = None,
         cache_values: Optional[torch.Tensor] = None,
         use_cache: bool = True,
+        depth: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         The backbone of the draft model.

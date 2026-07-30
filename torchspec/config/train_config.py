@@ -111,6 +111,8 @@ class TrainingConfig:
     sp_ulysses_size: int = 1
 
     gradient_checkpointing: bool = False
+    eagle3_loss_mask_mode: str = "assistant"
+    eagle3_hidden_state_dropout: float = 0.0
     learning_rate: float = 1e-4
     load_path: Optional[str] = None
     lr_decay_style: str = "cosine"

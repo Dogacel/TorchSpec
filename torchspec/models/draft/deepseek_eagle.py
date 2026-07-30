@@ -583,6 +583,7 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
         cache_keys: Optional[torch.Tensor] = None,
         cache_values: Optional[torch.Tensor] = None,
         use_cache: bool = True,
+        depth: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self.midlayer(
             input_emb=input_embeds,

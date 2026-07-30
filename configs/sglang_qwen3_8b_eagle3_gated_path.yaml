@@ -1,0 +1,96 @@
+# Qwen3-8B EAGLE-3 depth-gated training on PerfectBlend.
+#
+# Single-node B200 allocation:
+#   - 6 GPUs: replicated EAGLE-3 trainers (micro-batch 4 each)
+#   - 2 GPUs: two independent SGLang target-model engines
+#
+# The shared PerfectBlend cache is intentional: its cache key exactly matches
+# this dataset/tokenizer/max-length combination.
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/draft_models/qwen3_8b_eagle3_gated.json
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../data/perfectblend_full_regen_train.jsonl
+  eval_data_path: ../data/perfectblend_full_regen_eval.jsonl
+  eval_interval: 5000
+  eval_micro_batch_size: 1
+  chat_template: qwen
+  prompt_key: conversations
+  defer_tokenization: false
+  last_turn_loss_only: auto
+  min_loss_tokens: 8
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 4
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  min_lr: 1e-5
+  lr_decay_style: cosine
+  warmup_ratio: 0.015
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 2048
+  num_epochs: 3
+  seed: 42
+  training_num_gpus_per_node: 6
+  training_num_nodes: 1
+  ttt_length: 7
+  save_interval: 10000
+  save_per_epoch: true
+  max_checkpoints: 3
+  prefetch_depth: 8
+  fsdp_strategy: REPLICATE
+  fsdp_reduce_dtype: bfloat16
+  gradient_checkpointing: false
+  distributed_timeout_minutes: 30
+  eagle3_loss_mask_mode: top1_path
+  eagle3_hidden_state_dropout: 0.05
+
+inference:
+  inference_engine_type: sgl
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 2
+  max_sample_pool_size: 256
+  inference_buffer_threshold: 128
+  inference_fetch_batch: 32
+  inference_batch_size: 16
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.7
+    init_timeout: 600
+    dist_timeout: 120
+    extra_args:
+      model_loader_extra_config:
+        enable_multithread_load: true
+        num_threads: 16
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: rdma
+  device_name: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+  enable_gpu_direct: false
+  global_segment_size: 32GB
+  local_buffer_size: 16GB
+  enable_hard_pin: true
+
+logging:
+  report_to: wandb
+  wandb_project: torchspec-eagle3
+  wandb_group: qwen3-8b-eagle3-gated-path
+  wandb_mode: online
+  wandb_random_suffix: true
+  wandb_dir: ./outputs/qwen3-8b-eagle3-gated-path/wandb
+
+output_dir: ./outputs/qwen3-8b-eagle3-gated-path
+cache_dir: ./cache/qwen3-8b-flowspec-full
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null

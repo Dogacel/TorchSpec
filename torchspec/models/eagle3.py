@@ -63,12 +63,26 @@ class Eagle3Model(nn.Module):
         length: int = 7,
         attention_backend="sdpa",
         gradient_checkpointing: bool = False,
+        loss_mask_mode: str = "assistant",
+        hidden_state_dropout: float = 0.0,
     ):
         super().__init__()
+        supported_loss_mask_modes = {"assistant", "top1_path"}
+        if loss_mask_mode not in supported_loss_mask_modes:
+            raise ValueError(
+                f"Unsupported Eagle3 loss_mask_mode={loss_mask_mode!r}; "
+                f"expected one of {sorted(supported_loss_mask_modes)}"
+            )
+        if not 0.0 <= hidden_state_dropout <= 1.0:
+            raise ValueError(
+                f"Eagle3 hidden_state_dropout must be in [0, 1], got {hidden_state_dropout}"
+            )
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
         self.gradient_checkpointing = gradient_checkpointing
+        self.loss_mask_mode = loss_mask_mode
+        self.hidden_state_dropout = hidden_state_dropout
         self.vocab_pruning = draft_model.vocab_size != draft_model.target_vocab_size
         self._usp_sp_group = get_draft_sp_group() if attention_backend == "usp" else None
         self._usp_ulysses_group = get_sp_ulysses_group() if attention_backend == "usp" else None
@@ -77,6 +91,25 @@ class Eagle3Model(nn.Module):
             if self._usp_ulysses_group is not None
             else 1
         )
+
+    def _apply_hidden_state_dropout(
+        self,
+        hidden_states: torch.Tensor,
+        depth: int,
+    ) -> torch.Tensor:
+        """Zero complete per-token rollout states after the first step.
+
+        Depth 0 always receives the target model's projected auxiliary hidden
+        state. Later depths independently drop the current rollout state
+        without rescaling, leaving the next-token embedding available.
+        """
+        if depth == 0 or not self.training or self.hidden_state_dropout == 0.0:
+            return hidden_states
+        keep_hidden = torch.rand(
+            hidden_states.shape[:2],
+            device=hidden_states.device,
+        ).ge(self.hidden_state_dropout)
+        return hidden_states * keep_hidden.unsqueeze(-1).to(hidden_states.dtype)
 
     def _calculate_loss(
         self,
@@ -137,6 +170,46 @@ class Eagle3Model(nn.Module):
                 return compiled_sum_forward_kl_loss_from_hs(*args)
             return compiled_forward_kl_loss_from_hs(*args)
 
+    @torch.no_grad()
+    def _top1_match_mask(
+        self,
+        hidden_states: torch.Tensor,
+        target: Union[PrecomputedTarget, LazyTarget],
+        mask: torch.Tensor,
+        idx: int,
+        seq_length: int,
+    ) -> torch.Tensor:
+        """Return a neutral mask with active positions set by top-1 agreement."""
+        match_mask = torch.ones_like(mask, dtype=torch.bool)
+        valid_idx = mask.flatten().nonzero().squeeze(-1)
+        if valid_idx.numel() == 0:
+            return match_mask
+
+        draft_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1]).index_select(
+            0, valid_idx
+        )
+        draft_top1 = self.draft_model.compute_logits(draft_hidden_states).argmax(-1)
+
+        if isinstance(target, PrecomputedTarget):
+            target_p_step = target.target_p_padded[:, idx : idx + seq_length, :]
+            target_top1 = (
+                target_p_step.reshape(-1, target_p_step.shape[-1])
+                .index_select(0, valid_idx)
+                .argmax(-1)
+            )
+        else:
+            target_hidden_states = target.hidden_states_padded[
+                :, idx : idx + seq_length, :
+            ].reshape(-1, target.lm_head_weight.shape[-1])
+            target_top1 = F.linear(
+                target_hidden_states.index_select(0, valid_idx),
+                target.lm_head_weight,
+            ).argmax(-1)
+
+        match_mask_flat = match_mask.flatten()
+        match_mask_flat[valid_idx] = draft_top1 == target_top1
+        return match_mask
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -185,6 +258,16 @@ class Eagle3Model(nn.Module):
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
+        top1_path = self.loss_mask_mode == "top1_path" and self.training
+        if top1_path and isinstance(target, PrecomputedTarget) and target.position_mask is not None:
+            valid_mask = target.position_mask
+        elif top1_path:
+            valid_mask = padding(attention_mask, left=False).to(loss_mask.dtype)
+        elif isinstance(target, PrecomputedTarget) and target.position_mask is not None:
+            valid_mask = loss_mask * target.position_mask.to(loss_mask.dtype)
+        else:
+            valid_mask = loss_mask
+
         if self.attention_backend == "sdpa":
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
@@ -194,10 +277,9 @@ class Eagle3Model(nn.Module):
                 past_key_values_length=past_key_values_length,
             )
 
-        if isinstance(target, PrecomputedTarget) and target.position_mask is not None:
-            mask = target.position_mask
-        else:
-            mask = loss_mask
+        # Top-1 path pruning is a training-time loss curriculum. Evaluation
+        # retains the normal assistant-only loss mask.
+        path_mask = torch.ones_like(valid_mask) if top1_path else None
 
         plosses = []
         vlosses = []
@@ -212,17 +294,17 @@ class Eagle3Model(nn.Module):
             is_last = idx == self.length - 1
 
             step_input_ids = input_ids
-            step_hidden_states = hidden_states
+            step_hidden_states = self._apply_hidden_state_dropout(hidden_states, depth=idx)
             step_attention_mask = attention_mask
             step_position_ids = position_ids
-            step_mask = mask
+            step_mask = valid_mask if path_mask is None else valid_mask * path_mask
             step_seq_length = seq_length
 
             if self.attention_backend == "usp":
                 step_seq_length = usp_chunk_size
                 step_input_ids = input_ids[:, :step_seq_length]
-                step_hidden_states = hidden_states[:, :step_seq_length, :]
-                step_mask = mask[:, :step_seq_length]
+                step_hidden_states = step_hidden_states[:, :step_seq_length, :]
+                step_mask = step_mask[:, :step_seq_length]
                 if attention_mask is not None:
                     step_attention_mask = attention_mask[:, :step_seq_length]
                 if position_ids is not None:
@@ -243,6 +325,7 @@ class Eagle3Model(nn.Module):
                     cache_keys,
                     cache_values,
                     True,
+                    idx,
                     use_reentrant=False,
                 )
             else:
@@ -254,6 +337,7 @@ class Eagle3Model(nn.Module):
                     cache_keys=cache_keys,
                     cache_values=cache_values,
                     use_cache=True,
+                    depth=idx,
                 )
 
             hidden_states = hidden_states_out
@@ -268,6 +352,26 @@ class Eagle3Model(nn.Module):
                 lm_head_weight=lm_head_weight,
                 norm_eps=norm_eps,
             )
+
+            if path_mask is not None and not is_last:
+                top1_match_mask = self._top1_match_mask(
+                    hidden_states=hidden_states,
+                    target=target,
+                    mask=step_mask,
+                    idx=idx,
+                    seq_length=step_seq_length,
+                )
+                step_survival_mask = (
+                    top1_match_mask.to(path_mask.dtype) * valid_mask[:, :step_seq_length]
+                )
+                if self.attention_backend == "usp":
+                    updated_path_mask = path_mask.clone()
+                    updated_path_mask[:, :step_seq_length] = (
+                        path_mask[:, :step_seq_length] * step_survival_mask
+                    )
+                    path_mask = updated_path_mask
+                else:
+                    path_mask = path_mask * step_survival_mask
 
             # Model takes its own normed hidden states as input for the next step, so apply norm here if needed.
             if self.draft_model.norm_output:
@@ -319,7 +423,7 @@ class Eagle3Model(nn.Module):
 
             if not is_last:
                 input_ids = padding(input_ids, left=False)
-                mask = padding(mask, left=False)
+                valid_mask = padding(valid_mask, left=False)
         return plosses, vlosses, acces, acc_counts
 
 

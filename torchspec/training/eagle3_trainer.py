@@ -106,6 +106,8 @@ class Eagle3Trainer(Trainer):
             length=self.args.ttt_length,
             attention_backend=self.args.attention_backend,
             gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
+            loss_mask_mode=getattr(self.args, "eagle3_loss_mask_mode", "assistant"),
+            hidden_state_dropout=getattr(self.args, "eagle3_hidden_state_dropout", 0.0),
         )
 
         full_state = eagle3_model.state_dict() if dist.get_rank() == 0 else {}
@@ -286,11 +288,14 @@ class Eagle3Trainer(Trainer):
         loss_mask = loss_mask.cuda()
 
         if self.t2d is not None:
+            target_position_mask = loss_mask
+            if getattr(self.args, "eagle3_loss_mask_mode", "assistant") == "top1_path":
+                target_position_mask = padding(batch["attention_mask"], left=False).cuda()
             target = compute_target_p_padded(
                 target_hidden_states=target_hidden_states,
                 target_lm_head_weight=self.target_lm_head_weight,
                 t2d=self.t2d,
-                loss_mask=loss_mask,
+                loss_mask=target_position_mask,
                 length=self.eagle3.length,
             )
         else:
@@ -367,10 +372,16 @@ class Eagle3Trainer(Trainer):
             return {}
 
         avg_vlosses = torch.stack([m["vlosses"] for m in all_step_metrics]).mean(dim=0)
-        avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
+        acc_correct = torch.stack([m["acces"] * m["acc_counts"] for m in all_step_metrics]).sum(
+            dim=0
+        )
+        acc_counts = torch.stack([m["acc_counts"] for m in all_step_metrics]).sum(dim=0)
 
         dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
-        dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+        dist.all_reduce(acc_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(acc_counts, op=dist.ReduceOp.SUM)
+
+        avg_acces = acc_correct / acc_counts.clamp_min(1.0)
 
         avg_acc_scalar = avg_acces.mean().item()
 

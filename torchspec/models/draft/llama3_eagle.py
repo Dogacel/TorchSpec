@@ -2316,7 +2316,7 @@ class LlamaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def forward(self, x, depth: int = 0):
         if self.config.pretraining_tp > 1:
             slice = self.intermediate_size // self.config.pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
@@ -2363,6 +2363,8 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
+    mlp_class = LlamaMLP
+
     def __init__(self, config, attention_backend: str = "sdpa"):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2382,7 +2384,7 @@ class LlamaDecoderLayer(nn.Module):
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
         self.attention_backend = attention_backend
-        self.mlp = LlamaMLP(config)
+        self.mlp = self.mlp_class(config)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -2396,6 +2398,7 @@ class LlamaDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
+        depth: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         residual = hidden_states
 
@@ -2417,7 +2420,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, depth=depth)
         hidden_states = residual + hidden_states
 
         return hidden_states, cache_keys, cache_values
@@ -2425,6 +2428,7 @@ class LlamaDecoderLayer(nn.Module):
 
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
     config_class = LlamaConfig
+    decoder_layer_class = LlamaDecoderLayer
 
     def __init__(self, config, attention_backend="sdpa") -> None:
         super().__init__(config)
@@ -2433,7 +2437,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.target_vocab_size = config.vocab_size
         self.vocab_size = getattr(config, "draft_vocab_size", None) or config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
-        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
+        self.midlayer = self.decoder_layer_class(config, attention_backend=attention_backend)
 
         target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
 
@@ -2499,6 +2503,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         cache_keys: Optional[torch.Tensor] = None,
         cache_values: Optional[torch.Tensor] = None,
         use_cache: bool = True,
+        depth: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self.midlayer(
             input_emb=input_embeds,
@@ -2508,4 +2513,5 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=use_cache,
+            depth=depth,
         )
