@@ -82,7 +82,12 @@ class OfflineDataset:
                     path = (self.root / row["file"]).resolve()
                     if self.root not in path.parents or not path.is_file():
                         raise FileNotFoundError(f"Offline sample not found: {path}")
-                    item = {"split": split, "data_id": data_id, "file": row["file"]}
+                    item = {
+                        "split": split,
+                        "data_id": data_id,
+                        "file": row["file"],
+                        "seq_len": row["seq_len"],
+                    }
                     self._rows[split].append(item)
                     self._by_id[data_id] = item
 
@@ -152,7 +157,12 @@ class OfflineDataset:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-        row = {"split": split, "data_id": data_id, "file": relative.as_posix()}
+        row = {
+            "split": split,
+            "data_id": data_id,
+            "file": relative.as_posix(),
+            "seq_len": int(saved["input_ids"].numel()),
+        }
         with (self.root / "manifest.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row) + "\n")
             stream.flush()
