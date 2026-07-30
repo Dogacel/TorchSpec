@@ -227,7 +227,7 @@ def test_controller_sources_manifest_ids_without_retokenizing(tmp_path):
     assert controller.load_dataset(args) == 1
     assert controller.load_eval_dataset(args) == 1
     assert controller._stored_dataset == [
-        {"data_id": "train-1", "metadata": {"offline_replay": True}}
+        {"data_id": "train-1", "metadata": {"offline_replay": True}, "seq_len": 4}
     ]
 
     controller.submit_eval_chunk(0, 1)

@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 import ray
 from ray.util.queue import Queue
 
+from torchspec.data.utils import length_grouped_order
 from torchspec.training.data_fetcher import TrainSample
 from torchspec.utils.logging import logger
 from torchspec.utils.memory import estimate_tensor_bytes
@@ -159,6 +160,7 @@ class AsyncTrainingController:
         self._dataset_epoch: int = 0
         self._dataset_seed: int = getattr(args, "seed", 42)
         self._shuffle_dataset: bool = getattr(args, "shuffle_dataset", True)
+        self._length_group_size: int = getattr(args, "length_group_size", 1024)
 
         self._start_time = time.time()
         self._inference_monitor = SpeedMonitor(window_seconds=10.0)
@@ -214,7 +216,11 @@ class AsyncTrainingController:
 
             dataset = OfflineDataset(args.offline_data_path)
             return [
-                {"data_id": str(row["data_id"]), "metadata": {"offline_replay": True}}
+                {
+                    "data_id": str(row["data_id"]),
+                    "metadata": {"offline_replay": True},
+                    "seq_len": row["seq_len"],
+                }
                 for row in dataset.rows(split)
             ]
 
@@ -250,7 +256,7 @@ class AsyncTrainingController:
         return len(self._stored_dataset)
 
     def _prepare_dataset(self, skip: int = 0) -> list:
-        """Return dataset for the current epoch, optionally shuffled.
+        """Return dataset for the current epoch, optionally shuffled and length-grouped.
 
         When shuffle is enabled the ordering is deterministic from
         (seed + epoch), so resume can reconstruct the same epoch ordering
@@ -265,6 +271,8 @@ class AsyncTrainingController:
             rng = random.Random(self._dataset_seed + self._dataset_epoch)
             rng.shuffle(data)
 
+        data = length_grouped_order(data, self._length_group_size)
+
         if skip > 0:
             skip = min(skip, len(data))
             data = data[skip:]
@@ -275,8 +283,8 @@ class AsyncTrainingController:
             else "shuffle disabled"
         )
         logger.info(
-            f"Prepared dataset ({len(data)} samples, {shuffle_tag}"
-            + (f", skipped {skip})" if skip > 0 else ")")
+            f"Prepared dataset ({len(data)} samples, {shuffle_tag}, "
+            f"length group {self._length_group_size}" + (f", skipped {skip})" if skip > 0 else ")")
         )
         return data
 

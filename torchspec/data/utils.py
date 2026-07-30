@@ -95,7 +95,7 @@ class DataCollatorWithPadding:
             # Round up to nearest bucket to reduce unique shapes for torch.compile.
             # Without this, every batch gets a different padded length, causing
             # FlexAttention recompilation (~1s overhead per new shape).
-            _BUCKET = 256
+            _BUCKET = 128
             max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
             attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]
 
@@ -379,6 +379,38 @@ def flatten_multimodal_content(messages, image_placeholder="<image>"):
                 text_parts.append("<video>")
         msg["content"] = "\n".join(text_parts)
     return messages
+
+
+def sample_length_hint(sample: Dict[str, Any]) -> int:
+    """Sequence length of a stored dataset entry, for length grouping.
+
+    Exactly one of these three is present: ``seq_len`` on offline replay rows,
+    the tokenized ``input_ids``, or — under ``defer_tokenization`` — only the
+    formatted text, whose character count is monotone in token count and free.
+    """
+    if "seq_len" in sample:
+        return sample["seq_len"]
+    if "input_ids" in sample:
+        return sample["input_ids"].numel()
+    return len(sample["formatted_prompt"])
+
+
+def length_grouped_order(samples: List[Any], group_size: int) -> List[Any]:
+    """Sort *samples* longest-first within fixed chunks of *group_size*.
+
+    Chunks are positional, so only the order inside each one changes. That keeps
+    a dispatch's sequences similar in length without turning length into a
+    curriculum the way a global sort would.
+    """
+    if group_size <= 1:
+        return list(samples)
+
+    ordered = []
+    for start in range(0, len(samples), group_size):
+        chunk = samples[start : start + group_size]
+        chunk.sort(key=sample_length_hint, reverse=True)
+        ordered.extend(chunk)
+    return ordered
 
 
 def estimate_row_count(data_path):
