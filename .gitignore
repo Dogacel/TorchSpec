@@ -92,3 +92,4 @@ wandb/log.txt
 wandb/
 data/
 profiles/
+.tmp/

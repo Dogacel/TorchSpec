@@ -76,6 +76,165 @@ class TestTrainingLoopCleanup:
         )
 
 
+def _run_mock_training_loop(
+    *,
+    prefetch_depth: int,
+    num_steps: int,
+    steps_per_epoch: int,
+    dispatch_results=None,
+):
+    args = SimpleNamespace(
+        training_num_nodes=1,
+        training_num_gpus_per_node=1,
+        num_train_steps=num_steps,
+        draft_accumulation_steps=1,
+        steps_per_epoch=steps_per_epoch,
+        num_epochs=(num_steps + steps_per_epoch - 1) // steps_per_epoch,
+        global_batch_size=1,
+        per_dp_rank_batch_size=1,
+        prefetch_depth=prefetch_depth,
+        enable_perf_metrics=False,
+        save_interval=0,
+        checkpoint_dir=None,
+        save_per_epoch=False,
+        train_with_decode=False,
+    )
+    events = []
+    results = iter(dispatch_results) if dispatch_results is not None else None
+
+    controller = mock.MagicMock()
+    controller.submit_training_dataset.remote.return_value = None
+    controller.reload_dataset.remote.return_value = None
+
+    def dispatch():
+        result = next(results) if results is not None else True
+        events.append(f"dispatch:{result}")
+        return result
+
+    controller.try_dispatch_batch.remote.side_effect = dispatch
+    controller.get_full_status.remote.return_value = {
+        "inference_speed": 0.0,
+        "sample_pool_size": 0,
+        "elapsed_seconds": 0.0,
+        "avg_inference_speed": 0.0,
+        "avg_training_speed": 0.0,
+    }
+
+    actor = mock.MagicMock()
+    actor.get_global_step.remote.return_value = 0
+
+    def train(*, step, num_batches):
+        assert num_batches == 1
+        events.append(f"train:{step}")
+        return {}
+
+    actor.train_from_queue.remote.side_effect = train
+    train_group = mock.MagicMock()
+    train_group._actor_handlers = [actor]
+
+    eval_state = eval_utils.EvalSetupState(
+        eval_interval=0,
+        eval_enabled=False,
+        eval_cache_loaded=False,
+        eval_cache_path=None,
+        best_eval_score=0.0,
+        eval_dispatch_bs=0,
+        eval_dataset_size=0,
+        dp_size=1,
+    )
+
+    with (
+        mock.patch("torchspec.controller.loop.setup_eval", return_value=eval_state),
+        mock.patch("torchspec.controller.loop.ray.get", side_effect=lambda value: value),
+        mock.patch("torchspec.controller.loop.time.sleep") as mock_sleep,
+        mock.patch("torchspec.controller.loop.tqdm"),
+    ):
+        loop.training_loop(
+            args,
+            controller,
+            mock.MagicMock(),
+            train_group,
+            dataset_size=max(num_steps, 1),
+            eval_dataset_size=0,
+        )
+
+    return events, controller, mock_sleep
+
+
+def test_training_loop_prefills_and_refills_controller_queue():
+    events, _, _ = _run_mock_training_loop(
+        prefetch_depth=2,
+        num_steps=3,
+        steps_per_epoch=3,
+    )
+
+    assert events == [
+        "dispatch:True",
+        "dispatch:True",
+        "train:0",
+        "dispatch:True",
+        "train:1",
+        "train:2",
+    ]
+
+
+def test_training_loop_prefetch_zero_preserves_one_step_dispatching():
+    events, _, _ = _run_mock_training_loop(
+        prefetch_depth=0,
+        num_steps=3,
+        steps_per_epoch=3,
+    )
+
+    assert events == [
+        "dispatch:True",
+        "train:0",
+        "dispatch:True",
+        "train:1",
+        "dispatch:True",
+        "train:2",
+    ]
+
+
+def test_training_loop_runs_ready_step_when_lookahead_cannot_be_filled():
+    events, _, mock_sleep = _run_mock_training_loop(
+        prefetch_depth=2,
+        num_steps=3,
+        steps_per_epoch=3,
+        dispatch_results=[True, False, True, True],
+    )
+
+    assert events == [
+        "dispatch:True",
+        "dispatch:False",
+        "train:0",
+        "dispatch:True",
+        "dispatch:True",
+        "train:1",
+        "train:2",
+    ]
+    mock_sleep.assert_not_called()
+
+
+def test_training_loop_does_not_prefetch_across_epoch_boundary():
+    events, controller, _ = _run_mock_training_loop(
+        prefetch_depth=3,
+        num_steps=4,
+        steps_per_epoch=2,
+    )
+
+    assert events == [
+        "dispatch:True",
+        "dispatch:True",
+        "train:0",
+        "train:1",
+        "dispatch:True",
+        "dispatch:True",
+        "train:2",
+        "train:3",
+    ]
+    controller.reload_dataset.remote.assert_called_once_with()
+
+
 def test_generate_eval_cache_dispatches_and_finalizes():
     controller = mock.MagicMock()
     train_group = mock.MagicMock()
