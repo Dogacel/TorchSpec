@@ -587,19 +587,43 @@ class PrefetchedDataFetcher:
         inner: MooncakeDataFetcher,
         prefetch_depth: int = 2,
         target_device: Optional[torch.device] = None,
+        prefetch_to_device: bool = True,
     ):
         self.inner = inner
         self.prefetch_depth = prefetch_depth
         self.target_device = target_device
+        self.prefetch_to_device = prefetch_to_device
         self._queue: queue.Queue = queue.Queue(maxsize=prefetch_depth)
         self._thread: Optional[threading.Thread] = None
         self._started = False
         self._error: Optional[BaseException] = None
+        self._cuda_stream: Optional[torch.cuda.Stream] = None
+        self._next_batch: Optional[Dict[str, torch.Tensor]] = None
+        self._next_ready: Optional[torch.cuda.Event] = None
+        self._exhausted = False
+
+        if target_device is not None and prefetch_to_device and torch.cuda.is_available():
+            device = (
+                torch.device("cuda", target_device)
+                if isinstance(target_device, int)
+                else torch.device(target_device)
+            )
+            if device.type == "cuda":
+                self.target_device = device
+                self._cuda_stream = torch.cuda.Stream(device=device)
+
+    def _pin_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if self._cuda_stream is None:
+            return batch
+        return {
+            k: v.pin_memory() if isinstance(v, torch.Tensor) and not v.is_pinned() else v
+            for k, v in batch.items()
+        }
 
     def _prefetch_loop(self) -> None:
         try:
             for batch in self.inner:
-                self._queue.put(batch)
+                self._queue.put(self._pin_batch(batch))
         except Exception as e:
             # Preserve the original traceback so re-raise in __next__
             # points to the actual failure site, not to __next__ itself.
@@ -617,7 +641,37 @@ class PrefetchedDataFetcher:
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         self._ensure_started()
+        if self._cuda_stream is not None and self._next_batch is None and not self._exhausted:
+            self._preload_cuda()
         return self
+
+    def _dequeue(self, *, block: bool = True) -> Optional[Dict[str, torch.Tensor]]:
+        if self._error is not None:
+            raise self._error
+        try:
+            item = self._queue.get() if block else self._queue.get_nowait()
+        except queue.Empty:
+            return None
+        if item is self._SENTINEL:
+            self._exhausted = True
+            if self._error is not None:
+                raise self._error
+            raise StopIteration
+        return item
+
+    def _preload_cuda(self, *, block: bool = True) -> None:
+        if self._cuda_stream is None or self._exhausted:
+            return
+        try:
+            item = self._dequeue(block=block)
+        except StopIteration:
+            return
+        if item is None:
+            return
+        with torch.cuda.stream(self._cuda_stream):
+            self._next_batch = self._to_device(item)
+            self._next_ready = torch.cuda.Event()
+            self._next_ready.record(self._cuda_stream)
 
     def _to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Move a batch of tensors to the target device (GPU)."""
@@ -629,11 +683,29 @@ class PrefetchedDataFetcher:
         }
 
     def __next__(self) -> Dict[str, torch.Tensor]:
-        if self._error is not None:
-            raise self._error
-        item = self._queue.get()
-        if item is self._SENTINEL:
-            if self._error is not None:
-                raise self._error
+        if self._cuda_stream is None:
+            item = self._dequeue()
+            if item is None:
+                raise StopIteration
+            return self._to_device(item)
+
+        if self._next_batch is None:
+            self._preload_cuda()
+        if self._next_batch is None:
             raise StopIteration
-        return self._to_device(item)
+
+        batch = self._next_batch
+        ready = self._next_ready
+        self._next_batch = None
+        self._next_ready = None
+
+        current_stream = torch.cuda.current_stream(self.target_device)
+        current_stream.wait_event(ready)
+        for value in batch.values():
+            if isinstance(value, torch.Tensor):
+                value.record_stream(current_stream)
+
+        # Queue the following H2D copy before returning so it overlaps the
+        # consumer's forward/backward work on the current stream.
+        self._preload_cuda(block=False)
+        return batch

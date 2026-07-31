@@ -27,7 +27,7 @@ import os
 import time
 from argparse import Namespace
 from contextlib import nullcontext
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -49,6 +49,55 @@ from torchspec.utils.logging import logger
 from torchspec.utils.processing import get_assistant_token_ids
 from torchspec.utils.profiling import TrainProfiler
 from torchspec.utils.train_dump import extract_gradients, extract_model_weights
+
+
+@dataclasses.dataclass
+class DeferredTrainMetrics:
+    """One-step-delayed GPU metric transfer.
+
+    The current step enqueues a non-blocking copy into pinned host memory. The
+    next step is submitted before these values are materialized, allowing CPU
+    launch work to overlap the previous step's device-to-host dependency.
+    """
+
+    cpu_values: torch.Tensor
+    source_values: torch.Tensor
+    ready_event: torch.cuda.Event
+    metric_step: int
+    finalize_values: Callable[[list[float]], dict]
+    data_time: float = 0.0
+    compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = dataclasses.field(
+        default_factory=list
+    )
+    optimizer_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = dataclasses.field(
+        default_factory=list
+    )
+    step_events: Optional[tuple[torch.cuda.Event, torch.cuda.Event]] = None
+
+    def finalize(self) -> dict:
+        if self.step_events is not None:
+            self.step_events[1].synchronize()
+        else:
+            self.ready_event.synchronize()
+
+        metrics = self.finalize_values(self.cpu_values.tolist())
+        metrics["_metrics_step"] = self.metric_step
+
+        if self.step_events is not None:
+            metrics["perf/step_time"] = (
+                self.step_events[0].elapsed_time(self.step_events[1]) / 1000.0
+            )
+            metrics["perf/data_time"] = self.data_time
+            metrics["perf/compute_time"] = (
+                sum(start.elapsed_time(end) for start, end in self.compute_events) / 1000.0
+            )
+            metrics["perf/optimizer_time"] = (
+                sum(start.elapsed_time(end) for start, end in self.optimizer_events) / 1000.0
+            )
+
+        # The copy and timing events are complete; release the CUDA source now.
+        self.source_values = torch.empty(0)
+        return metrics
 
 
 class Trainer(abc.ABC):
@@ -89,6 +138,7 @@ class Trainer(abc.ABC):
         self.max_dump_steps = getattr(args, "max_dump_steps", 5)
 
         self._enable_perf_metrics = getattr(args, "enable_perf_metrics", True)
+        self._pending_train_metrics: Optional[DeferredTrainMetrics] = None
 
         self._io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._eval_cache_save_future: Optional[concurrent.futures.Future] = None
@@ -215,11 +265,13 @@ class Trainer(abc.ABC):
                 inner_fetcher,
                 prefetch_depth=prefetch_depth,
                 target_device=gpu_device,
+                prefetch_to_device=getattr(self.args, "prefetch_to_device", True),
             )
             logger.info(
                 f"[Rank {self.dp_rank}] Prefetched data fetcher initialized "
                 f"(batch_size={per_dp_rank_batch_size}, prefetch_depth={prefetch_depth}, "
-                f"staging=CPU, target={gpu_device})"
+                f"staging=CPU, target={gpu_device}, "
+                f"device_prefetch={getattr(self.args, 'prefetch_to_device', True)})"
             )
         else:
             self.data_fetcher = inner_fetcher
@@ -324,12 +376,28 @@ class Trainer(abc.ABC):
         perf = self._enable_perf_metrics
         if perf:
             t0 = time.time()
+            step_start = torch.cuda.Event(enable_timing=True)
+            step_end = torch.cuda.Event(enable_timing=True)
+            step_start.record()
         metrics = self._train_core_from_queue(step=step, num_batches=num_batches)
-        if perf:
-            # _aggregate_metrics already copied metrics to CPU, so wall-clock is accurate.
+        if isinstance(metrics, DeferredTrainMetrics):
+            if perf:
+                step_end.record()
+                metrics.step_events = (step_start, step_end)
+            previous_metrics = self._pending_train_metrics
+            self._pending_train_metrics = metrics
+            metrics = previous_metrics.finalize() if previous_metrics is not None else {}
+        elif perf:
+            # Immediate metric aggregation has already synchronized the step.
             metrics["perf/step_time"] = time.time() - t0
         self.prof.step(step=step)
         return metrics
+
+    def flush_pending_metrics(self) -> dict:
+        """Materialize the final deferred training metrics, if any."""
+        pending = self._pending_train_metrics
+        self._pending_train_metrics = None
+        return pending.finalize() if pending is not None else {}
 
     def _train_core_from_queue(self, step: int, num_batches: int) -> dict:
         """Training loop skeleton.
@@ -406,18 +474,25 @@ class Trainer(abc.ABC):
         self.global_step += 1
 
         metrics = self._aggregate_metrics(all_step_metrics, step, grad_norm=grad_norm)
-        # _aggregate_metrics copies metrics to CPU, so all recorded events are
-        # completed and safe to query without another synchronization.
         if perf:
-            compute_time_ms = sum(s.elapsed_time(e) for s, e in compute_events)
-            metrics["perf/data_time"] = data_time
-            metrics["perf/compute_time"] = compute_time_ms / 1000.0
-            # Optimizer timing (only recorded in last micro-batch)
-            opt_ms = 0.0
+            optimizer_events = []
             for m in all_step_metrics:
                 if "_opt_events" in m:
-                    opt_ms += m["_opt_events"][0].elapsed_time(m["_opt_events"][1])
-            metrics["perf/optimizer_time"] = opt_ms / 1000.0
+                    optimizer_events.append(m["_opt_events"])
+
+            if isinstance(metrics, DeferredTrainMetrics):
+                metrics.data_time = data_time
+                metrics.compute_events = compute_events
+                metrics.optimizer_events = optimizer_events
+            else:
+                # Immediate aggregation synchronized CUDA, so event queries are ready.
+                metrics["perf/data_time"] = data_time
+                metrics["perf/compute_time"] = (
+                    sum(start.elapsed_time(end) for start, end in compute_events) / 1000.0
+                )
+                metrics["perf/optimizer_time"] = (
+                    sum(start.elapsed_time(end) for start, end in optimizer_events) / 1000.0
+                )
 
         return metrics
 

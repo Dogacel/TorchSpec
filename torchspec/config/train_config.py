@@ -98,6 +98,9 @@ class TrainingConfig:
     continual_training: bool = False
     distributed_backend: str = "nccl"
     distributed_timeout_minutes: int = 10
+    ddp_bucket_cap_mb: Optional[float] = None
+    ddp_gradient_as_bucket_view: bool = True
+    ddp_static_graph: bool = False
     draft_accumulation_steps: int = 1
     fsdp_reduce_dtype: str = "float32"  # "float32" or "bfloat16"
     fsdp_strategy: str = "REPLICATE"
@@ -107,6 +110,9 @@ class TrainingConfig:
     training_node_ips: Optional[list[str]] = None
     training_node_selectors: Optional[list[dict[str, str]]] = None
     compile_model: bool = False  # torch.compile the full training model
+    compile_decoder: bool = False  # compile the EAGLE decoder MLP
+    eagle3_projection_dtype: str = "float32"  # "float32" or "bfloat16"
+    flatten_optimizer_buffers: bool = False
     sp_ring_size: int = 1
     sp_ulysses_size: int = 1
 
@@ -126,6 +132,7 @@ class TrainingConfig:
     num_train_steps: Optional[int] = None
     micro_batch_size: int = 2
     prefetch_depth: int = 2  # 0 = disabled, >0 = async pre-fetch N batches ahead
+    prefetch_to_device: bool = True  # overlap pinned CPU -> GPU copies with compute
     save_interval: int = 5000
     save_per_epoch: bool = False
     max_checkpoints: int = 0  # 0 = keep all, N > 0 = rotate and keep only N most recent

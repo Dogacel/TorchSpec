@@ -18,6 +18,8 @@ from torchspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 from torchspec.models.eagle3 import (
     Eagle3Model,
     PrecomputedTarget,
+    _build_loss_candidates,
+    _shift_loss_candidates,
     compute_lazy_target_padded,
     compute_target_p_padded,
 )
@@ -160,11 +162,138 @@ class TestCompiledForwardKLLoss(unittest.TestCase):
         self.assertGreaterEqual(acc.item(), 0.0)
         self.assertLessEqual(acc.item(), 1.0)
 
+    def test_fixed_capacity_weights_match_compacted_loss(self):
+        torch.manual_seed(1)
+        N, H, V = 8, 32, 24
+        hs = torch.randn(N, H)
+        target_p = F.softmax(torch.randn(N, V), dim=-1)
+        norm_weight = torch.randn(H)
+        lm_head_weight = torch.randn(V, H)
+        valid_idx = torch.tensor([0, 2, 4, 6, 1, 3])
+        valid_weights = torch.tensor([1, 0, 1, 1, 0, 1], dtype=torch.bool)
+
+        packed = compiled_forward_kl_loss(
+            hs,
+            target_p,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            1e-6,
+            valid_weights,
+        )
+        compacted = compiled_forward_kl_loss(
+            hs,
+            target_p,
+            valid_idx[valid_weights],
+            norm_weight,
+            lm_head_weight,
+            1e-6,
+        )
+        for actual, expected in zip(packed, compacted):
+            torch.testing.assert_close(actual, expected)
+
+    def test_compact_target_matches_dense_target(self):
+        torch.manual_seed(2)
+        N, H, V = 10, 32, 24
+        hs = torch.randn(N, H)
+        dense_target = F.softmax(torch.randn(N, V), dim=-1)
+        norm_weight = torch.randn(H)
+        lm_head_weight = torch.randn(V, H)
+        valid_idx = torch.tensor([1, 3, 4, 8])
+
+        dense = compiled_forward_kl_loss(
+            hs,
+            dense_target,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            1e-6,
+        )
+        compact_target = dense_target.index_select(0, valid_idx)
+        compact = compiled_forward_kl_loss(
+            hs,
+            compact_target,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            1e-6,
+            None,
+            True,
+            compact_target.argmax(dim=-1),
+        )
+        for actual, expected in zip(compact, dense):
+            torch.testing.assert_close(actual, expected)
+
+        dense_hs = hs.detach().clone().requires_grad_(True)
+        compact_hs = hs.detach().clone().requires_grad_(True)
+        dense_loss = compiled_forward_kl_loss(
+            dense_hs,
+            dense_target,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            1e-6,
+        )[0]
+        compact_loss = compiled_forward_kl_loss(
+            compact_hs,
+            compact_target,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            1e-6,
+            None,
+            True,
+            compact_target.argmax(dim=-1),
+        )[0]
+        dense_loss.backward()
+        compact_loss.backward()
+        torch.testing.assert_close(compact_hs.grad, dense_hs.grad)
+
+
+class TestShiftLossCandidates(unittest.TestCase):
+    def test_depth_shift_preserves_batch_boundaries_and_masks_borders(self):
+        base_idx = torch.tensor([0, 2, 5, 6, 8, 11])
+        candidate_valid = torch.tensor([1, 1, 0, 1, 1, 1], dtype=torch.bool)
+        shifted, weights = _shift_loss_candidates(
+            base_idx,
+            depth=2,
+            base_seq_length=6,
+            step_seq_length=6,
+            candidate_valid=candidate_valid,
+        )
+
+        torch.testing.assert_close(shifted, torch.tensor([0, 0, 3, 6, 6, 9]))
+        torch.testing.assert_close(
+            weights,
+            torch.tensor([0, 1, 0, 0, 1, 1], dtype=torch.bool),
+        )
+
+    def test_vectorized_depth_candidates_match_scalar_reference(self):
+        base_idx = torch.tensor([0, 2, 5, 6, 8, 11])
+        candidate_valid = torch.tensor([1, 1, 0, 1, 1, 1], dtype=torch.bool)
+        indices, weights = _build_loss_candidates(
+            base_idx,
+            depth_count=4,
+            base_seq_length=6,
+            step_seq_length=6,
+            candidate_valid=candidate_valid,
+        )
+        for depth in range(4):
+            expected_indices, expected_weights = _shift_loss_candidates(
+                base_idx,
+                depth=depth,
+                base_seq_length=6,
+                step_seq_length=6,
+                candidate_valid=candidate_valid,
+            )
+            torch.testing.assert_close(indices[depth], expected_indices)
+            torch.testing.assert_close(weights[depth], expected_weights)
+
 
 class TestComputeTargetPPadded(unittest.TestCase):
     """compute_target_p_padded: shape, dtype, and probability correctness."""
 
-    def test_pruning_shapes_and_position_mask(self):
+    def test_pruning_shapes_and_candidate_mask(self):
         torch.manual_seed(0)
         B, T, D = 2, 16, 64
         V_target, V_draft = 128, 32
@@ -185,14 +314,16 @@ class TestComputeTargetPPadded(unittest.TestCase):
         )
 
         self.assertIsInstance(result, PrecomputedTarget)
-        self.assertEqual(result.target_p_padded.shape, (B, T + length, V_draft))
-        self.assertIsNotNone(result.position_mask)
-        self.assertEqual(result.position_mask.shape, (B, T))
-        sums = result.target_p_padded[:, :T, :].sum(dim=-1)
+        self.assertTrue(result.compact)
+        self.assertEqual(result.target_p_padded.shape, (B * T, V_draft))
+        self.assertIsNotNone(result.candidate_valid)
+        self.assertEqual(result.candidate_valid.shape, (B * T,))
+        self.assertEqual(result.target_argmax.shape, (B * T,))
+        sums = result.target_p_padded.sum(dim=-1)
         torch.testing.assert_close(sums, torch.ones_like(sums), atol=1e-4, rtol=1e-4)
 
-    def test_loss_mask_respected_in_position_mask(self):
-        """Masked positions should have position_mask == 0."""
+    def test_loss_mask_respected_in_candidate_mask(self):
+        """Only loss-mask positions should be represented as candidates."""
         torch.manual_seed(0)
         B, T, D = 1, 32, 64
         V_target, V_draft = 128, 32
@@ -212,7 +343,27 @@ class TestComputeTargetPPadded(unittest.TestCase):
             length=3,
         )
 
-        self.assertTrue((result.position_mask[:, : T // 2] == 0).all())
+        self.assertEqual(result.candidate_valid.shape, (T // 2,))
+
+    def test_full_vocab_target_is_compacted_to_loss_positions(self):
+        torch.manual_seed(3)
+        B, T, D, V = 2, 12, 32, 48
+        hs = torch.randn(B, T, D, dtype=torch.bfloat16)
+        weight = torch.randn(V, D, dtype=torch.bfloat16)
+        loss_valid_idx = torch.tensor([2, 5, 12, 20])
+
+        result = compute_target_p_padded(
+            hs,
+            weight,
+            loss_valid_idx=loss_valid_idx,
+        )
+        selected_hs = hs.reshape(-1, D).index_select(0, loss_valid_idx)
+        expected = F.softmax(F.linear(selected_hs, weight).float(), dim=-1)
+
+        self.assertTrue(result.compact)
+        self.assertIsNone(result.candidate_valid)
+        torch.testing.assert_close(result.target_p_padded, expected)
+        torch.testing.assert_close(result.target_argmax, expected.argmax(dim=-1))
 
 
 class TestLazyVsPrecomputedTarget(unittest.TestCase):
@@ -278,6 +429,47 @@ class TestLazyVsPrecomputedTarget(unittest.TestCase):
                 rtol=1e-4,
                 msg=f"Accuracy mismatch at position {i}",
             )
+
+    def test_compact_pruned_target_matches_dense_pruned_target(self):
+        torch.manual_seed(7)
+        H, V_target, V_draft, B, T, length = 64, 96, 32, 2, 16, 3
+        config = _make_config(H=H, V=V_target, draft_V=V_draft)
+        model = _make_model(config, length=length)
+        batch = _make_batch(B, T, H, V_target)
+        loss_valid_idx = batch["loss_mask"].reshape(-1).bool().nonzero().flatten()
+        target_weight = torch.randn(V_target, H, dtype=torch.bfloat16)
+        t2d = torch.zeros(V_target, dtype=torch.bool)
+        t2d[:V_draft] = True
+
+        compact = compute_target_p_padded(
+            batch["target_hidden_states"],
+            target_weight,
+            t2d=t2d,
+            loss_valid_idx=loss_valid_idx,
+            length=length,
+        )
+        dense_logits = F.linear(batch["target_hidden_states"], target_weight[t2d])
+        dense = PrecomputedTarget(
+            F.pad(F.softmax(dense_logits.float(), dim=-1), (0, 0, 0, length)),
+            candidate_valid=compact.candidate_valid,
+        )
+
+        outputs = []
+        for target in (dense, compact):
+            with torch.no_grad():
+                plosses, _, acces, _ = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    target=target,
+                    loss_mask=batch["loss_mask"],
+                    loss_valid_idx=loss_valid_idx,
+                    hidden_states=batch["hidden_states"],
+                )
+            outputs.append((plosses, acces))
+
+        for compact_values, dense_values in zip(outputs[1], outputs[0]):
+            for compact_value, dense_value in zip(compact_values, dense_values):
+                torch.testing.assert_close(compact_value, dense_value)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
     def test_losses_match_cuda(self):

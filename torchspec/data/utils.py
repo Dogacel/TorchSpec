@@ -108,10 +108,20 @@ class DataCollatorWithPadding:
         batch_loss_mask = torch.cat(
             [self.paddingtensor2D(self._get_loss_mask(item), max_length) for item in features]
         )
+        # Pack valid loss positions while masks are still on the CPU prefetch path.
+        # A Python scan is intentional: GPU ``nonzero`` has a data-dependent output
+        # shape and therefore synchronizes the host before every EAGLE depth.
+        flat_loss_mask = batch_loss_mask.reshape(-1)
+        loss_valid_idx = torch.tensor(
+            [i for i, value in enumerate(flat_loss_mask.tolist()) if value],
+            dtype=torch.long,
+            device=flat_loss_mask.device,
+        )
         batch = {
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
             "loss_mask": batch_loss_mask,
+            "loss_valid_idx": loss_valid_idx,
             "hidden_states": None,
             "target": None,
             "last_hidden_states": None,

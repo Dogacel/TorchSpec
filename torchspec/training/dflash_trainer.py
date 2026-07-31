@@ -191,6 +191,7 @@ class DFlashTrainer(Trainer):
             total_steps=total_steps,
             decay_style=decay_style if decay_style != "WSD" else "cosine",
             min_lr=getattr(self.args, "min_lr", 0.0),
+            flatten_buffers=getattr(self.args, "flatten_optimizer_buffers", False),
         )
 
         if decay_style == "WSD" and total_steps:

@@ -174,7 +174,15 @@ def apply_fsdp2(
 
     if strategy == "REPLICATE":
         logger.info("Using REPLICATE strategy (DDP-like, gradient all-reduce only)")
-        replicate(model, device_mesh=mesh)
+        replicate_kwargs = {
+            "device_mesh": mesh,
+            "gradient_as_bucket_view": getattr(args, "ddp_gradient_as_bucket_view", True),
+            "static_graph": getattr(args, "ddp_static_graph", False),
+        }
+        bucket_cap_mb = getattr(args, "ddp_bucket_cap_mb", None)
+        if bucket_cap_mb is not None:
+            replicate_kwargs["bucket_cap_mb"] = bucket_cap_mb
+        replicate(model, **replicate_kwargs)
         if args is not None and getattr(args, "attention_backend", None) == "usp":
             sp_size = getattr(args, "sp_ulysses_size", 1) * getattr(args, "sp_ring_size", 1)
             if sp_size > 1:
