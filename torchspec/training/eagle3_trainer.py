@@ -59,6 +59,10 @@ class Eagle3Trainer(Trainer):
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.target_lm_head: Optional[torch.nn.Module] = None
+        self._ploss_weights = tuple(
+            _position_decay_weights(args.ttt_length, getattr(args, "ploss_weights", None))
+        )
+        self._ploss_weight_sum = sum(self._ploss_weights)
 
     def init_model(
         self,
@@ -314,10 +318,10 @@ class Eagle3Trainer(Trainer):
         return plosses, vlosses, acces, acc_counts
 
     def _backward(self, plosses: List[torch.Tensor], accumulation_steps: int = 1) -> torch.Tensor:
-        ploss_weight = _position_decay_weights(
-            len(plosses), getattr(self.args, "ploss_weights", None)
+        ploss = (
+            sum(self._ploss_weights[i] * plosses[i] for i in range(len(plosses)))
+            / accumulation_steps
         )
-        ploss = sum(ploss_weight[i] * plosses[i] for i in range(len(plosses))) / accumulation_steps
         ploss.backward()
         return ploss
 
@@ -461,41 +465,51 @@ class Eagle3Trainer(Trainer):
         avg_vlosses = torch.stack([m["vlosses"] for m in all_step_metrics]).mean(dim=0)
         avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
 
-        dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
-        dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+        num_depths = avg_vlosses.shape[0]
+        reduced_metrics = torch.cat((avg_vlosses, avg_acces))
+        dist.all_reduce(reduced_metrics, op=dist.ReduceOp.AVG)
 
-        avg_acc_scalar = avg_acces.mean().item()
-
-        # Simulated acceptance length: acc_0 + acc_0*acc_1 + acc_0*acc_1*acc_2 + ...
-        # Models the expected number of consecutively accepted draft tokens,
-        # which better reflects actual speculative decoding performance.
-        cumulative = 1.0
-        simulated_acc_len = 0.0
-        for i in range(avg_acces.shape[0]):
-            cumulative *= avg_acces[i].item()
-            simulated_acc_len += cumulative
-
-        ploss_weights = torch.tensor(
-            _position_decay_weights(
-                avg_vlosses.shape[0], getattr(self.args, "ploss_weights", None)
-            ),
-            device=avg_vlosses.device,
+        grad_norm_value = (
+            grad_norm.to(device=avg_vlosses.device, dtype=avg_vlosses.dtype)
+            if grad_norm is not None
+            else avg_vlosses.new_zeros(())
         )
-        weighted_avg_loss = (avg_vlosses * ploss_weights).sum().item() / ploss_weights.sum().item()
+        packed_metrics = torch.cat(
+            (
+                reduced_metrics,
+                grad_norm_value.reshape(1),
+            )
+        ).detach()
+        metric_values = packed_metrics.float().cpu().tolist()
+
+        ploss_values = metric_values[:num_depths]
+        acc_values = metric_values[num_depths : 2 * num_depths]
+        grad_norm_scalar = metric_values[-1]
+
+        weighted_avg_loss_value = (
+            sum(loss * weight for loss, weight in zip(ploss_values, self._ploss_weights))
+            / self._ploss_weight_sum
+        )
+        avg_acc_scalar = sum(acc_values) / num_depths
+        cumulative = 1.0
+        simulated_acc_len_value = 0.0
+        for acc in acc_values:
+            cumulative *= acc
+            simulated_acc_len_value += cumulative
 
         metrics = {
-            "train/avg_loss": weighted_avg_loss,
+            "train/avg_loss": weighted_avg_loss_value,
             "train/avg_acc": avg_acc_scalar,
-            "train/simulated_acc_len": simulated_acc_len,
-            "train/grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
+            "train/simulated_acc_len": simulated_acc_len_value,
+            "train/grad_norm": grad_norm_scalar,
             "train/global_step": self.global_step,
             "train/lr": self.optimizer.get_learning_rate(),
             "train/step": step,
         }
 
-        for i in range(avg_vlosses.shape[0]):
-            metrics[f"train/ploss_{i}"] = avg_vlosses[i].item()
-            metrics[f"train/acc_{i}"] = avg_acces[i].item()
+        for i in range(num_depths):
+            metrics[f"train/ploss_{i}"] = ploss_values[i]
+            metrics[f"train/acc_{i}"] = acc_values[i]
 
         if dist.get_rank() == 0:
             logger.debug(f"step {step}: {metrics}")

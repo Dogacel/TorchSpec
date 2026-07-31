@@ -326,7 +326,7 @@ class Trainer(abc.ABC):
             t0 = time.time()
         metrics = self._train_core_from_queue(step=step, num_batches=num_batches)
         if perf:
-            # _aggregate_metrics already synced via .item() — wall-clock is accurate
+            # _aggregate_metrics already copied metrics to CPU, so wall-clock is accurate.
             metrics["perf/step_time"] = time.time() - t0
         self.prof.step(step=step)
         return metrics
@@ -406,8 +406,8 @@ class Trainer(abc.ABC):
         self.global_step += 1
 
         metrics = self._aggregate_metrics(all_step_metrics, step, grad_norm=grad_norm)
-        # _aggregate_metrics calls .item() which syncs CUDA —
-        # all recorded events are now completed, safe to query without extra sync
+        # _aggregate_metrics copies metrics to CPU, so all recorded events are
+        # completed and safe to query without another synchronization.
         if perf:
             compute_time_ms = sum(s.elapsed_time(e) for s, e in compute_events)
             metrics["perf/data_time"] = data_time
