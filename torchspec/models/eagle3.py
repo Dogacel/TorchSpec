@@ -281,11 +281,7 @@ class Eagle3Model(nn.Module):
 
             loss = local_sum_loss / local_count.clamp_min(1.0)
             metric_loss = loss.detach()
-            metric_acc = (
-                (local_correct / local_count.clamp_min(1.0)).detach()
-                if float(local_count.detach().float().cpu()) > 0.0
-                else local_correct.detach().float() * 0.0
-            )
+            metric_acc = (local_correct / local_count.clamp_min(1.0)).detach()
 
             if self._usp_sp_group is not None:
                 reduced_stats = torch.stack(
@@ -299,16 +295,9 @@ class Eagle3Model(nn.Module):
                 reduced_sum_loss, reduced_correct, reduced_count = reduced_stats.unbind()
                 denom = reduced_count.clamp_min(1.0)
                 loss = (local_sum_loss / denom).to(loss.dtype)
-                if reduced_count.item() > 0:
-                    metric_loss = (reduced_sum_loss / denom).detach()
-                    metric_acc = (reduced_correct / denom).to(
-                        device=loss.device, dtype=torch.float32
-                    )
-                    metric_count = reduced_count.to(device=loss.device, dtype=torch.float32)
-                else:
-                    metric_loss = reduced_sum_loss.detach() * 0.0
-                    metric_acc = local_correct.detach().float() * 0.0
-                    metric_count = reduced_count.to(device=loss.device, dtype=torch.float32)
+                metric_loss = (reduced_sum_loss / denom).detach()
+                metric_acc = (reduced_correct / denom).to(device=loss.device, dtype=torch.float32)
+                metric_count = reduced_count.to(device=loss.device, dtype=torch.float32)
             else:
                 metric_count = local_count.detach().float().to(device=loss.device)
 

@@ -45,7 +45,11 @@ class BF16Optimizer:
         self.fp32_grads = [torch.zeros_like(mp) for mp in self.fp32_params]
         for mp in self.fp32_params:
             mp.requires_grad = True
-        self.optimizer = torch.optim.AdamW(self.fp32_params, lr=lr, weight_decay=weight_decay)
+        self.optimizer = torch.optim.AdamW(
+            self.fp32_params,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
         self.scheduler = LRSchedulerWithWarmup(
             self.optimizer,
             max_lr=lr,
@@ -75,8 +79,7 @@ class BF16Optimizer:
                     mp.grad = None
 
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
-        if grad_norm > 0.0:
-            self.optimizer.step()
+        self.optimizer.step()
 
         self.optimizer.zero_grad()
         self.scheduler.step()
