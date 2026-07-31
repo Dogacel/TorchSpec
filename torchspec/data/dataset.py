@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import contextlib
 import hashlib
 import logging as _logging
 import multiprocessing as mp
@@ -88,11 +89,10 @@ def _tokenize_single(args):
     )
     if not processed["input_ids"]:
         return None
-    # Return plain lists instead of tensors to avoid shared memory mmap
-    # exhaustion when transferring results across process boundaries.
-    input_ids = processed["input_ids"][0]
+    # Tensors pickle by /dev/shm handle (one fd per sample, exhausted at 1M) and
+    # lists rebuild every token as a PyLong; numpy crosses as bytes, zero-copy back.
     return {
-        "input_ids": input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids,
+        "input_ids": processed["input_ids"][0].numpy(),
         "packed_loss_mask": processed["packed_loss_mask"][0],
         "formatted_prompt": processed["formatted_text"][0],
     }
@@ -189,29 +189,6 @@ def load_conversation_dataset(args):
     total_estimate = estimate_row_count(args.train_data_path)
     num_proc = getattr(args, "num_proc", 64)
 
-    # Pass 1: collect and normalize raw samples (fast I/O, no tokenization)
-    raw_samples = []
-    for idx, sample in enumerate(tqdm(hf_dataset, desc="Loading samples", total=total_estimate)):
-        raw_prompt = sample.get(prompt_key, "")
-
-        if not isinstance(raw_prompt, list):
-            raise ValueError(
-                f"Expected conversation format (list of messages) for sample {idx}, got {type(raw_prompt)}"
-            )
-
-        messages = _normalize_conversation(raw_prompt)
-        multimodal_inputs = extract_media_urls(messages)
-        flatten_multimodal_content(messages, custom_template.image_placeholder)
-        data_id = sample.get("id", f"sample_{idx}")
-        raw_samples.append((data_id, messages, multimodal_inputs))
-
-    logger.info(
-        f"Loaded {len(raw_samples)} samples, {mode_label.lower()} with {num_proc} workers..."
-    )
-
-    # Pass 2: process in parallel
-    work_items = [(messages, max_length, train_with_decode) for _, messages, _ in raw_samples]
-
     last_turn_loss_only = getattr(args, "last_turn_loss_only", False)
     if defer_tokenization:
         worker_init = _init_format_worker
@@ -236,11 +213,43 @@ def load_conversation_dataset(args):
         worker_fn = _tokenize_single
         desc = "Tokenizing dataset"
 
+    # Fork before pass 1 fills raw_samples: CPython refcounts dirty every page a
+    # worker reads, so inheriting the loaded corpus costs 4.5x to copy-on-write.
     if num_proc <= 1:
         worker_init(*worker_initargs)
-        results = [worker_fn(item) for item in tqdm(work_items, desc=desc)]
+        pool_ctx = contextlib.nullcontext()
     else:
-        with mp.Pool(num_proc, initializer=worker_init, initargs=worker_initargs) as pool:
+        pool_ctx = mp.Pool(num_proc, initializer=worker_init, initargs=worker_initargs)
+
+    with pool_ctx as pool:
+        # Pass 1: collect and normalize raw samples (fast I/O, no tokenization)
+        raw_samples = []
+        for idx, sample in enumerate(
+            tqdm(hf_dataset, desc="Loading samples", total=total_estimate)
+        ):
+            raw_prompt = sample.get(prompt_key, "")
+
+            if not isinstance(raw_prompt, list):
+                raise ValueError(
+                    f"Expected conversation format (list of messages) for sample {idx}, got {type(raw_prompt)}"
+                )
+
+            messages = _normalize_conversation(raw_prompt)
+            multimodal_inputs = extract_media_urls(messages)
+            flatten_multimodal_content(messages, custom_template.image_placeholder)
+            data_id = sample.get("id", f"sample_{idx}")
+            raw_samples.append((data_id, messages, multimodal_inputs))
+
+        logger.info(
+            f"Loaded {len(raw_samples)} samples, {mode_label.lower()} with {num_proc} workers..."
+        )
+
+        # Pass 2: process in parallel
+        work_items = [(messages, max_length, train_with_decode) for _, messages, _ in raw_samples]
+
+        if pool is None:
+            results = [worker_fn(item) for item in tqdm(work_items, desc=desc)]
+        else:
             results = list(
                 tqdm(
                     pool.imap(worker_fn, work_items, chunksize=64),
@@ -273,10 +282,7 @@ def load_conversation_dataset(args):
         }
 
         if not defer_tokenization:
-            input_ids = result["input_ids"]
-            if isinstance(input_ids, list):
-                input_ids = torch.tensor(input_ids)
-            entry["input_ids"] = input_ids
+            entry["input_ids"] = torch.from_numpy(result["input_ids"])
             entry["packed_loss_mask"] = result["packed_loss_mask"]
 
         prompts.append(entry)
