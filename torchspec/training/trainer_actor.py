@@ -106,6 +106,9 @@ class TrainerActor(RayActor):
     def train_from_queue(self, step: int, num_batches: int) -> dict:
         return self._trainer.train_from_queue(step, num_batches)
 
+    def flush_pending_train_metrics(self) -> dict:
+        return self._trainer.flush_pending_metrics()
+
     def set_train_queue(self, queue, mooncake_config=None, per_dp_rank_batch_size: int = 1):
         return self._trainer.set_train_queue(
             queue, mooncake_config=mooncake_config, per_dp_rank_batch_size=per_dp_rank_batch_size

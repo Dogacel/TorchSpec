@@ -29,7 +29,7 @@ from torchspec.models.eagle3 import compute_lazy_target_padded, compute_target_p
 from torchspec.training import checkpoint
 from torchspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
 from torchspec.training.optimizer import BF16Optimizer
-from torchspec.training.trainer import Trainer
+from torchspec.training.trainer import DeferredTrainMetrics, Trainer
 from torchspec.utils.distributed import get_gloo_group
 from torchspec.utils.logging import logger
 from torchspec.utils.tensor import padding
@@ -63,6 +63,7 @@ class Eagle3Trainer(Trainer):
             _position_decay_weights(args.ttt_length, getattr(args, "ploss_weights", None))
         )
         self._ploss_weight_sum = sum(self._ploss_weights)
+        self._metric_buffers: list[torch.Tensor] = []
 
     def init_model(
         self,
@@ -458,7 +459,7 @@ class Eagle3Trainer(Trainer):
 
     def _aggregate_metrics(
         self, all_step_metrics: list[dict], step: int, *, grad_norm: torch.Tensor = None
-    ) -> dict:
+    ) -> dict | DeferredTrainMetrics:
         if not all_step_metrics:
             return {}
 
@@ -474,14 +475,60 @@ class Eagle3Trainer(Trainer):
             if grad_norm is not None
             else avg_vlosses.new_zeros(())
         )
-        packed_metrics = torch.cat(
-            (
-                reduced_metrics,
-                grad_norm_value.reshape(1),
+        packed_metrics = (
+            torch.cat(
+                (
+                    reduced_metrics,
+                    grad_norm_value.reshape(1),
+                )
             )
-        ).detach()
-        metric_values = packed_metrics.float().cpu().tolist()
+            .detach()
+            .float()
+        )
+        metric_step = self.global_step
+        learning_rate = self.optimizer.get_learning_rate()
 
+        def finalize_values(metric_values: list[float]) -> dict:
+            return self._build_train_metrics(
+                metric_values,
+                num_depths=num_depths,
+                metric_step=metric_step,
+                learning_rate=learning_rate,
+            )
+
+        if packed_metrics.device.type != "cuda":
+            return finalize_values(packed_metrics.tolist())
+
+        if not self._metric_buffers:
+            self._metric_buffers = [
+                torch.empty(
+                    packed_metrics.numel(),
+                    dtype=torch.float32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for _ in range(2)
+            ]
+        cpu_values = self._metric_buffers[metric_step % len(self._metric_buffers)]
+        cpu_values.copy_(packed_metrics, non_blocking=True)
+        ready_event = torch.cuda.Event()
+        ready_event.record()
+        return DeferredTrainMetrics(
+            cpu_values=cpu_values,
+            source_values=packed_metrics,
+            ready_event=ready_event,
+            metric_step=metric_step,
+            finalize_values=finalize_values,
+        )
+
+    def _build_train_metrics(
+        self,
+        metric_values: list[float],
+        *,
+        num_depths: int,
+        metric_step: int,
+        learning_rate: float,
+    ) -> dict:
         ploss_values = metric_values[:num_depths]
         acc_values = metric_values[num_depths : 2 * num_depths]
         grad_norm_scalar = metric_values[-1]
@@ -502,9 +549,9 @@ class Eagle3Trainer(Trainer):
             "train/avg_acc": avg_acc_scalar,
             "train/simulated_acc_len": simulated_acc_len_value,
             "train/grad_norm": grad_norm_scalar,
-            "train/global_step": self.global_step,
-            "train/lr": self.optimizer.get_learning_rate(),
-            "train/step": step,
+            "train/global_step": metric_step,
+            "train/lr": learning_rate,
+            "train/step": metric_step,
         }
 
         for i in range(num_depths):
@@ -512,6 +559,6 @@ class Eagle3Trainer(Trainer):
             metrics[f"train/acc_{i}"] = acc_values[i]
 
         if dist.get_rank() == 0:
-            logger.debug(f"step {step}: {metrics}")
+            logger.debug(f"step {metric_step}: {metrics}")
 
         return metrics

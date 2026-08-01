@@ -49,6 +49,7 @@ class BF16Optimizer:
             self.fp32_params,
             lr=lr,
             weight_decay=weight_decay,
+            fused=True,
         )
         self.scheduler = LRSchedulerWithWarmup(
             self.optimizer,
@@ -71,12 +72,17 @@ class BF16Optimizer:
             grad_norm: The gradient norm before clipping (for logging).
         """
         with torch.no_grad():
+            grad_destinations = []
+            grad_sources = []
             for p, mp, g in zip(self.model_params, self.fp32_params, self.fp32_grads):
                 if p.grad is not None:
-                    g.copy_(p.grad)
+                    grad_destinations.append(g)
+                    grad_sources.append(p.grad)
                     mp.grad = g
                 else:
                     mp.grad = None
+            if grad_destinations:
+                torch._foreach_copy_(grad_destinations, grad_sources)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
         self.optimizer.step()
@@ -84,8 +90,8 @@ class BF16Optimizer:
         self.optimizer.zero_grad()
         self.scheduler.step()
         with torch.no_grad():
-            for p, mp in zip(self.model_params, self.fp32_params):
-                p.data.copy_(mp.data.to(p.dtype))
+            torch._foreach_copy_(self.model_params, self.fp32_params)
+            for p in self.model_params:
                 p.grad = None
 
         return grad_norm
@@ -105,8 +111,7 @@ class BF16Optimizer:
     def sync_fp32_params_from_model(self):
         """Reinitialize fp32_params from model params. Call after loading model checkpoint."""
         with torch.no_grad():
-            for mp, p in zip(self.fp32_params, self.model_params):
-                mp.data.copy_(p.data.to(torch.float32))
+            torch._foreach_copy_(self.fp32_params, self.model_params)
 
     def state_dict(self):
         return self.optimizer.state_dict()

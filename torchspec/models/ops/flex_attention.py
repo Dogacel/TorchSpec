@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from functools import lru_cache
+
 import torch
 import torch._dynamo as dynamo
 import torch._inductor.config as inductor_config
@@ -342,7 +344,7 @@ def build_eagle3_block_mask(
     )
 
 
-def eagle3_block_mask(
+def _make_eagle3_block_mask(
     Q_LEN: int,
     KV_LEN: int,
     *,
@@ -403,4 +405,64 @@ def eagle3_block_mask(
         KV_LEN=KV_LEN,
         device=device,
         BLOCK_SIZE=(Q_BS, KV_BS),
+    )
+
+
+@lru_cache(maxsize=128)
+def _cached_eagle3_block_mask(
+    Q_LEN: int,
+    KV_LEN: int,
+    B: int,
+    H: int,
+    device: str,
+    Q_BS: int,
+    KV_BS: int,
+    lck: int,
+) -> "BlockMask":
+    return _make_eagle3_block_mask(
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        B=B,
+        H=H,
+        device=torch.device(device),
+        BLOCK_SIZE=(Q_BS, KV_BS),
+        lck=lck,
+    )
+
+
+def eagle3_block_mask(
+    Q_LEN: int,
+    KV_LEN: int,
+    *,
+    B: int = 1,
+    H: int = 1,
+    device: torch.device = "cuda",
+    BLOCK_SIZE: "int | tuple[int, int]" = 128,
+    lck: int = 0,
+) -> "BlockMask":
+    """Return a cached, read-only Eagle3 block mask for a sequence shape."""
+    Q_BS, KV_BS = _normalize_block_size(BLOCK_SIZE)
+    if is_torchdynamo_compiling():
+        return _make_eagle3_block_mask(
+            Q_LEN=Q_LEN,
+            KV_LEN=KV_LEN,
+            B=B,
+            H=H,
+            device=device,
+            BLOCK_SIZE=(Q_BS, KV_BS),
+            lck=lck,
+        )
+
+    resolved_device = torch.device(device)
+    if resolved_device.type == "cuda" and resolved_device.index is None:
+        resolved_device = torch.device("cuda", torch.cuda.current_device())
+    return _cached_eagle3_block_mask(
+        Q_LEN,
+        KV_LEN,
+        B,
+        H,
+        str(resolved_device),
+        Q_BS,
+        KV_BS,
+        lck,
     )
