@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 
 from torchspec import AutoDraftModelConfig, AutoEagle3DraftModel, Eagle3Model
-from torchspec.models.eagle3 import compute_lazy_target_padded, compute_target_p_padded
+from torchspec.models.eagle3 import compute_target_p_padded
 from torchspec.training import checkpoint
 from torchspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
 from torchspec.training.optimizer import BF16Optimizer
@@ -289,21 +289,15 @@ class Eagle3Trainer(Trainer):
         if loss_mask.dim() == 3:
             loss_mask = loss_mask.squeeze(-1)
         loss_mask = loss_mask.cuda()
+        loss_valid_idx = batch["loss_valid_idx"].cuda()
 
-        if self.t2d is not None:
-            target = compute_target_p_padded(
-                target_hidden_states=target_hidden_states,
-                target_lm_head_weight=self.target_lm_head_weight,
-                t2d=self.t2d,
-                loss_mask=loss_mask,
-                length=self.eagle3.length,
-            )
-        else:
-            target = compute_lazy_target_padded(
-                target_hidden_states,
-                self.target_lm_head_weight,
-                self.eagle3.length,
-            )
+        target = compute_target_p_padded(
+            target_hidden_states=target_hidden_states,
+            target_lm_head_weight=self.target_lm_head_weight,
+            t2d=self.t2d,
+            loss_valid_idx=loss_valid_idx,
+            length=self.eagle3.length,
+        )
         del target_hidden_states
 
         plosses, vlosses, acces, acc_counts = self.model(
@@ -311,6 +305,7 @@ class Eagle3Trainer(Trainer):
             attention_mask=batch["attention_mask"].cuda(),
             target=target,
             loss_mask=loss_mask,
+            loss_valid_idx=loss_valid_idx,
             hidden_states=batch["hidden_states"].cuda(),
             position_ids=batch.get("position_ids").cuda()
             if batch.get("position_ids") is not None

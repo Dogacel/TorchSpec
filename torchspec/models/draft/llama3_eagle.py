@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
 
@@ -1347,6 +1347,34 @@ class LlamaAttention(nn.Module):
         return attn_output, cache_keys, cache_values
 
 
+@torch.compile(dynamic=True)
+def merge_eagle3_depth_attention(
+    base_output: torch.Tensor,
+    base_lse: torch.Tensor,
+    query_states: torch.Tensor,
+    extra_keys: torch.Tensor,
+    extra_values: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Merge same-position depth K/V with causal FlexAttention output.
+
+    ``extra_keys`` and ``extra_values`` have shape ``[B, H, R, T, D]``.
+    FlexAttention supplies the normalized output and natural-log LSE for the
+    original causal block. Combining the additional logits through that LSE is
+    exactly equivalent to one softmax over ``T + R`` visible keys.
+    """
+    extra_logits = (query_states.unsqueeze(2) * extra_keys).sum(dim=-1) * scale
+    extra_logits = extra_logits.permute(0, 1, 3, 2).float()
+    combined_lse = torch.logaddexp(base_lse.float(), torch.logsumexp(extra_logits, dim=-1))
+
+    base_scale = torch.exp(base_lse.float() - combined_lse).unsqueeze(-1)
+    extra_weights = torch.exp(extra_logits - combined_lse.unsqueeze(-1))
+    extra_values = extra_values.permute(0, 1, 3, 2, 4).float()
+    output = base_output.float() * base_scale
+    output = output + (extra_weights.unsqueeze(-1) * extra_values).sum(dim=-2)
+    return output.to(base_output.dtype)
+
+
 class LlamaFlexAttention(LlamaAttention):
     """
     Attention layer implemented with flex attention. We keep the parameters consistent with LlamaAttention.
@@ -1368,8 +1396,12 @@ class LlamaFlexAttention(LlamaAttention):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         bsz, q_len, _ = hidden_states.size()
 
-        # cache_keys shape: [bsz, num_kv_heads, cache_seq_len, head_dim] (concatenated along seq dim)
-        past_seen_tokens = cache_keys.shape[2] if cache_keys is not None else 0
+        # Keep one raw K/V tensor per EAGLE depth. Materializing a cumulative
+        # [depth * sequence] cache at every round copies all earlier blocks and
+        # makes the cache traffic quadratic in depth.
+        key_chunks = () if cache_keys is None else cache_keys
+        value_chunks = () if cache_values is None else cache_values
+        lck = len(key_chunks)
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -1383,7 +1415,6 @@ class LlamaFlexAttention(LlamaAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        lck = past_seen_tokens // q_len
         if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
             cos, sin = self.rotary_emb(query_states, position_ids + lck)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
@@ -1402,35 +1433,46 @@ class LlamaFlexAttention(LlamaAttention):
                 query_states, key_states, cos, sin, position_ids + lck
             )
 
-        # Concatenate along sequence dimension: [bsz, num_kv_heads, total_seq_len, head_dim]
-        if cache_keys is not None:
-            key_cache = torch.cat([cache_keys, key_states], dim=2)
-            value_cache = torch.cat([cache_values, value_states], dim=2)
-        else:
-            key_cache = key_states
-            value_cache = value_states
+        key_chunks = (*key_chunks, key_states)
+        value_chunks = (*value_chunks, value_states)
 
         flex_attention_func = flex_attention if q_len <= 128 else compile_friendly_flex_attention
 
         block_mask = eagle3_block_mask(
             Q_LEN=q_len,
-            KV_LEN=key_cache.shape[-2],
+            KV_LEN=q_len,
             B=bsz,
             H=1,  # Rely on broadcast
             device=query_states.device,
-            lck=lck,
+            lck=0,
         )
-        attn_output = flex_attention_func(
+        attn_output, aux = flex_attention_func(
             query=query_states,
-            key=key_cache.contiguous(),
-            value=value_cache.contiguous(),
+            key=key_chunks[0].contiguous(),
+            value=value_chunks[0].contiguous(),
             block_mask=block_mask,
             enable_gqa=True,
+            return_aux=AuxRequest(lse=True),
         )
+        if lck:
+            extra_keys = torch.stack(
+                [repeat_kv(key, self.num_key_value_groups) for key in key_chunks[1:]], dim=2
+            )
+            extra_values = torch.stack(
+                [repeat_kv(value, self.num_key_value_groups) for value in value_chunks[1:]], dim=2
+            )
+            attn_output = merge_eagle3_depth_attention(
+                attn_output,
+                aux.lse,
+                query_states,
+                extra_keys,
+                extra_values,
+                1.0 / math.sqrt(self.head_dim),
+            )
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
-        return attn_output, key_cache, value_cache
+        return attn_output, key_chunks, value_chunks
 
 
 class LlamaFlashAttention(LlamaAttention):
@@ -2351,7 +2393,19 @@ class LlamaRMSNorm(nn.Module):
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        # Keep epsilon as a non-persistent scalar buffer so Dynamo can guard it
+        # as a tensor without creating a CPU tensor and calling ``item()`` on
+        # every invocation. Store its float32 bits in an integer buffer so
+        # ``model.to(dtype=...)`` moves it without downcasting the epsilon.
+        self.register_buffer(
+            "_variance_epsilon_bits",
+            torch.tensor(eps, dtype=torch.float32).view(torch.int32),
+            persistent=False,
+        )
+
+    @property
+    def variance_epsilon(self) -> torch.Tensor:
+        return self._variance_epsilon_bits.view(torch.float32)
 
     @torch.compile(dynamic=True)
     def forward(self, hidden_states):

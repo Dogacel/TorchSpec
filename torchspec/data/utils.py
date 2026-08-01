@@ -108,10 +108,12 @@ class DataCollatorWithPadding:
         batch_loss_mask = torch.cat(
             [self.paddingtensor2D(self._get_loss_mask(item), max_length) for item in features]
         )
+        loss_valid_idx = batch_loss_mask.reshape(-1).nonzero(as_tuple=True)[0]
         batch = {
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
             "loss_mask": batch_loss_mask,
+            "loss_valid_idx": loss_valid_idx,
             "hidden_states": None,
             "target": None,
             "last_hidden_states": None,

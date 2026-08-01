@@ -203,6 +203,11 @@ class TestBuildEagle3BlockMask(unittest.TestCase):
 class TestEagle3BlockMaskDispatcher(unittest.TestCase):
     """Dispatcher picks analytical when shapes align, otherwise falls back."""
 
+    def test_identical_shapes_reuse_cached_mask(self):
+        first = eagle3_block_mask(256, 768, B=1, H=1, device=DEVICE)
+        second = eagle3_block_mask(256, 768, B=1, H=1, device=DEVICE)
+        self.assertIs(first, second)
+
     def test_analytical_path_when_aligned(self):
         for Q, KV in [(256, 256), (256, 768)]:
             with self.subTest(Q=Q, KV=KV):

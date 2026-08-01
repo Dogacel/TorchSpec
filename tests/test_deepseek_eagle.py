@@ -24,8 +24,8 @@ from torchspec.models.draft.deepseek_eagle import (
 from torchspec.models.draft.llama3_eagle import yarn_get_mscale
 from torchspec.models.eagle3 import (
     Eagle3Model,
-    PrecomputedTarget,
     compute_lazy_target_padded,
+    compute_target_p_padded,
 )
 
 
@@ -315,12 +315,13 @@ class TestEagle3ModelTTT(unittest.TestCase):
         draft_model = model.draft_model
         _, lm_head_weight, _ = draft_model.get_lm_head_params()
 
-        with torch.no_grad():
-            target_logits = F.linear(batch["target_hidden_states"], lm_head_weight.detach())
-            target_p = F.softmax(target_logits.float(), dim=-1)
-        target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
-
-        precomputed = PrecomputedTarget(target_p_padded)
+        loss_valid_idx = batch["loss_mask"].reshape(-1).bool().nonzero().flatten()
+        precomputed = compute_target_p_padded(
+            batch["target_hidden_states"],
+            lm_head_weight.detach(),
+            loss_valid_idx=loss_valid_idx,
+            length=length,
+        )
         with torch.no_grad():
             plosses_pre, _, acces_pre = model(
                 input_ids=batch["input_ids"],
@@ -400,12 +401,13 @@ class TestFlexAttentionTTT(unittest.TestCase):
         draft_model = model.draft_model
         _, lm_head_weight, _ = draft_model.get_lm_head_params()
 
-        with torch.no_grad():
-            target_logits = F.linear(batch["target_hidden_states"], lm_head_weight.detach())
-            target_p = F.softmax(target_logits.float(), dim=-1)
-        target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
-
-        precomputed = PrecomputedTarget(target_p_padded)
+        loss_valid_idx = batch["loss_mask"].reshape(-1).bool().nonzero().flatten()
+        precomputed = compute_target_p_padded(
+            batch["target_hidden_states"],
+            lm_head_weight.detach(),
+            loss_valid_idx=loss_valid_idx,
+            length=length,
+        )
         with torch.no_grad():
             plosses, _, acces = model(
                 input_ids=batch["input_ids"],
@@ -434,12 +436,13 @@ class TestFlexAttentionTTT(unittest.TestCase):
             draft_model = model.draft_model
             _, lm_head_weight, _ = draft_model.get_lm_head_params()
 
-            with torch.no_grad():
-                target_logits = F.linear(batch["target_hidden_states"], lm_head_weight.detach())
-                target_p = F.softmax(target_logits.float(), dim=-1)
-            target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
-
-            precomputed = PrecomputedTarget(target_p_padded)
+            loss_valid_idx = batch["loss_mask"].reshape(-1).bool().nonzero().flatten()
+            precomputed = compute_target_p_padded(
+                batch["target_hidden_states"],
+                lm_head_weight.detach(),
+                loss_valid_idx=loss_valid_idx,
+                length=length,
+            )
             with torch.no_grad():
                 plosses, _, _ = model(
                     input_ids=batch["input_ids"],

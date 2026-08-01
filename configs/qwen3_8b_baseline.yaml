@@ -1,0 +1,77 @@
+# Configuration for train_entry.py with vLLM Engine inference (nested config format)
+#
+# GPU allocation:
+#   - 2 GPUs for inference (duplicate mode: each engine has full model copy)
+#   - 2 GPUs for training (DP/FSDP: model sharded across 2 GPUs)
+#   - Total: 4 GPUs
+#
+# Installation:
+#   pip install -e ".[vllm]"  # Install vLLM backend
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/vllm_qwen3_8b.yaml
+#
+# Note: Uses vLLM's extract_hidden_states speculative method with MooncakeHiddenStatesConnector.
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../data/perfectblend_50k_train.jsonl
+  eval_data_path: ../data/perfectblend_50k_eval.jsonl
+  eval_interval: 100
+  chat_template: qwen
+  prompt_key: conversations
+  length_group_size: 1
+
+logging:
+  report_to: wandb
+  use_tensorboard: true
+  use_wandb: true
+  wandb_mode: online
+  wandb_project: torchspec-test
+  wandb_random_suffix: false
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 16384
+  num_epochs: 1
+  seed: 42
+  training_num_gpus_per_node: 3
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: true
+  warmup_ratio: 0.015
+
+inference:
+  inference_engine_type: sgl
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.7
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: rdma
+  global_segment_size: 32GB
+  local_buffer_size: 8GB
+  enable_gpu_direct: false
+
+output_dir: ./outputs/qwen3-8b-smoke
+cache_dir: ./cache
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null

@@ -1,0 +1,89 @@
+# Short profiling run based on qwen3_8b_grouped.yaml.
+#
+# Profiles optimizer steps 10-19 during a short 256-step training run.
+# Six trainer ranks write compressed PyTorch traces under:
+#   outputs/qwen3-8b-grouped-profile/profiles
+#
+# Usage:
+#   python -m torchspec.train_entry \
+#     --config configs/qwen3_8b_grouped_profile.yaml
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../cache/dataset/qwen3-8b-sample-1m
+  eval_data_path: null
+  eval_interval: 100
+  chat_template: qwen
+  prompt_key: messages
+  length_group_size: 128
+
+logging:
+  report_to: wandb
+  use_tensorboard: true
+  use_wandb: true
+  wandb_mode: online
+  wandb_project: torchspec-profile
+  wandb_group: qwen3-8b-grouped-profile
+  wandb_random_suffix: true
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 16384
+  prefetch_depth: 4
+  num_train_steps: 256
+  seed: 42
+  training_num_gpus_per_node: 3
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: false
+  warmup_ratio: 0.015
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  vllm:
+    tp_size: 1
+    mem_fraction_static: 0.7
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: rdma
+  # One NIC, named explicitly. Only the roce* HCAs are usable (the ib* ones sit
+  # in state INIT, no SM), and auto-discovery grabs all four, which charges
+  # ~224GiB against the 211.6GiB memlock cap and fails registration with -600.
+  # Pairing NICs across PCIe complexes also fails: P22<->P6 slices error out and
+  # the rail is paused for 30s at a time.
+  device_name: roceP6p3s0f0
+  global_segment_size: 32GB
+  local_buffer_size: 16GB
+  enable_gpu_direct: false
+  enable_hard_pin: true
+
+output_dir: ./outputs/qwen3-8b-grouped-profile
+cache_dir: ./cache
+model_download_dir: null
+
+debug:
+  enable_perf_metrics: true
+  use_pytorch_profiler: true
+  profile_target:
+    - train_overall
+  profile_step_start: 10
+  profile_step_end: 20
+  profile_dir_name: ./outputs/qwen3-8b-grouped-profile/profiles
+  record_memory_history: false
+  save_debug_train_data: null

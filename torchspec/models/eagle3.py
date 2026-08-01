@@ -37,15 +37,15 @@ from torchspec.utils.distributed import (
     get_sp_ring_rank,
     get_sp_ulysses_group,
 )
-from torchspec.utils.tensor import padding
 
 
 @dataclass
 class PrecomputedTarget:
-    """Pre-computed target probabilities (used with vocab pruning)."""
+    """Target probabilities packed to the supervised positions."""
 
-    target_p_padded: torch.Tensor  # (B, T + length, V_draft)
-    position_mask: Optional[torch.Tensor] = None  # (B, T)
+    target_p_padded: torch.Tensor  # (N_loss_candidates, V_draft)
+    candidate_valid: Optional[torch.Tensor] = None  # (N_loss_candidates,)
+    target_argmax: Optional[torch.Tensor] = None  # (N_loss_candidates,) argmax of the above
 
 
 @dataclass
@@ -54,6 +54,44 @@ class LazyTarget:
 
     hidden_states_padded: torch.Tensor  # (B, T + length, D)
     lm_head_weight: torch.Tensor  # (V_full, D)
+
+
+def _pack_loss_mask_indices(loss_mask: torch.Tensor) -> torch.Tensor:
+    """Compatibility path for direct model callers without collator-packed indices.
+
+    Production training supplies ``loss_valid_idx`` from the CPU prefetch path.
+    Keeping this fallback avoids an API break for standalone/tests while still
+    avoiding a data-dependent GPU ``nonzero`` operation.
+    """
+    flat_mask = loss_mask.detach().reshape(-1)
+    values = flat_mask.cpu().tolist()
+    return torch.tensor(
+        [i for i, value in enumerate(values) if value],
+        dtype=torch.long,
+        device=loss_mask.device,
+    )
+
+
+def _build_loss_candidates(
+    loss_valid_idx: torch.Tensor,
+    *,
+    depth_count: int,
+    base_seq_length: int,
+    step_seq_length: int,
+    candidate_valid: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build fixed-capacity indices for every TTT depth in one GPU operation."""
+    batch_idx = torch.div(loss_valid_idx, base_seq_length, rounding_mode="floor")
+    base_position = loss_valid_idx.remainder(base_seq_length)
+    depths = torch.arange(depth_count, device=loss_valid_idx.device).unsqueeze(1)
+    shifted_position = base_position.unsqueeze(0) - depths
+    valid_weights = (shifted_position >= 0) & (shifted_position < step_seq_length)
+    valid_idx = batch_idx.unsqueeze(0) * step_seq_length + shifted_position.clamp(
+        0, step_seq_length - 1
+    )
+    if candidate_valid is not None:
+        valid_weights = valid_weights & candidate_valid.unsqueeze(0)
+    return valid_idx, valid_weights
 
 
 class Eagle3Model(nn.Module):
@@ -82,28 +120,35 @@ class Eagle3Model(nn.Module):
         self,
         hidden_states: torch.Tensor,
         target: Union[PrecomputedTarget, LazyTarget],
-        mask: torch.Tensor,
+        valid_idx: torch.Tensor,
+        valid_weights: torch.Tensor,
         idx: int,
         seq_length: int,
         norm_weight: torch.Tensor,
         lm_head_weight: torch.Tensor,
         norm_eps: float,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        valid_idx = mask.flatten().nonzero().squeeze(-1)
         if valid_idx.numel() == 0:
             # FSDP requires every trainable param to participate in gradient
             # all-reduce/reduce-scatter.
             total = sum(p.reshape(-1)[0] for p in self.parameters() if p.requires_grad)
             zero = total * 0.0
             return zero, zero.detach(), zero.detach()
-        # Important as it prevents recompilation.
+
         torch._dynamo.maybe_mark_dynamic(valid_idx, 0)
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
 
         if isinstance(target, PrecomputedTarget):
-            target_p_step = target.target_p_padded[:, idx : idx + seq_length, :]
-            tp_flat = target_p_step.reshape(-1, target_p_step.shape[-1])
-            args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, norm_eps)
+            args = (
+                hs_flat,
+                target.target_p_padded,
+                valid_idx,
+                norm_weight,
+                lm_head_weight,
+                norm_eps,
+                valid_weights,
+                target.target_argmax,
+            )
             if self.gradient_checkpointing and self.training:
                 return torch_checkpoint(
                     compiled_forward_kl_loss,
@@ -123,6 +168,7 @@ class Eagle3Model(nn.Module):
                 lm_head_weight,
                 target.lm_head_weight,
                 norm_eps,
+                valid_weights,
             )
             use_sum_lazy_loss = self.attention_backend == "usp"
             if self.gradient_checkpointing and self.training:
@@ -146,6 +192,7 @@ class Eagle3Model(nn.Module):
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        loss_valid_idx: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
@@ -153,6 +200,8 @@ class Eagle3Model(nn.Module):
 
         norm_weight, lm_head_weight, norm_eps = self.draft_model.get_lm_head_params()
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
+        if loss_valid_idx is None:
+            loss_valid_idx = _pack_loss_mask_indices(loss_mask)
 
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
@@ -194,11 +243,6 @@ class Eagle3Model(nn.Module):
                 past_key_values_length=past_key_values_length,
             )
 
-        if isinstance(target, PrecomputedTarget) and target.position_mask is not None:
-            mask = target.position_mask
-        else:
-            mask = loss_mask
-
         plosses = []
         vlosses = []
         acces = []
@@ -206,23 +250,38 @@ class Eagle3Model(nn.Module):
         cache_keys = None
         cache_values = None
 
+        loss_seq_length = usp_chunk_size if self.attention_backend == "usp" else seq_length
+        candidate_valid = target.candidate_valid if isinstance(target, PrecomputedTarget) else None
+        loss_indices, loss_weights = _build_loss_candidates(
+            loss_valid_idx,
+            depth_count=self.length,
+            base_seq_length=seq_length,
+            step_seq_length=loss_seq_length,
+            candidate_valid=candidate_valid,
+        )
+
         input_ids = input_ids.clamp(min=0, max=self.draft_model.target_vocab_size - 1)
+        # Every TTT step shifts the token ids left by one and fills the tail with
+        # token 0. The embedding is frozen, so embed the overlapping extended
+        # sequence once and take views instead of launching the same lookup for
+        # every depth.
+        if self.length > 1:
+            tail_ids = input_ids.new_zeros((batch_size, self.length - 1))
+            extended_input_ids = torch.cat((input_ids, tail_ids), dim=1)
+        else:
+            extended_input_ids = input_ids
+        all_input_embeds = self.draft_model.embed_input_ids(extended_input_ids)
+        all_input_embeds = all_input_embeds.to(hidden_states.dtype)
 
         for idx in range(self.length):
-            is_last = idx == self.length - 1
-
-            step_input_ids = input_ids
             step_hidden_states = hidden_states
             step_attention_mask = attention_mask
             step_position_ids = position_ids
-            step_mask = mask
             step_seq_length = seq_length
 
             if self.attention_backend == "usp":
                 step_seq_length = usp_chunk_size
-                step_input_ids = input_ids[:, :step_seq_length]
                 step_hidden_states = hidden_states[:, :step_seq_length, :]
-                step_mask = mask[:, :step_seq_length]
                 if attention_mask is not None:
                     step_attention_mask = attention_mask[:, :step_seq_length]
                 if position_ids is not None:
@@ -230,8 +289,7 @@ class Eagle3Model(nn.Module):
                         :, : step_seq_length * self._usp_ulysses_world_size
                     ]
 
-            inputs_embeds = self.draft_model.embed_input_ids(step_input_ids)
-            inputs_embeds = inputs_embeds.to(step_hidden_states.dtype)
+            inputs_embeds = all_input_embeds[:, idx : idx + step_seq_length]
 
             if self.gradient_checkpointing and self.training:
                 hidden_states_out, cache_keys, cache_values = torch_checkpoint(
@@ -261,7 +319,8 @@ class Eagle3Model(nn.Module):
             local_sum_loss, local_correct, local_count = self._calculate_loss(
                 hidden_states=hidden_states,
                 target=target,
-                mask=step_mask,
+                valid_idx=loss_indices[idx],
+                valid_weights=loss_weights[idx],
                 idx=idx,
                 seq_length=step_seq_length,
                 norm_weight=norm_weight,
@@ -306,9 +365,6 @@ class Eagle3Model(nn.Module):
             acces.append(metric_acc)
             acc_counts.append(metric_count)
 
-            if not is_last:
-                input_ids = padding(input_ids, left=False)
-                mask = padding(mask, left=False)
         return plosses, vlosses, acces, acc_counts
 
 
@@ -316,37 +372,61 @@ class Eagle3Model(nn.Module):
 def compute_target_p_padded(
     target_hidden_states: torch.Tensor,
     target_lm_head_weight: torch.Tensor,
-    t2d: torch.Tensor,
-    loss_mask: torch.Tensor,
-    length: int,
+    t2d: Optional[torch.Tensor] = None,
+    loss_mask: Optional[torch.Tensor] = None,
+    length: int = 7,
+    loss_valid_idx: Optional[torch.Tensor] = None,
     chunk_size: int = 4096,
 ) -> PrecomputedTarget:
+    """Project only supervised target states and reuse their distribution at every depth."""
+    del length  # Compact targets do not need depth padding.
     target_lm_head_weight = target_lm_head_weight.detach()
-    pruned_weight = target_lm_head_weight[t2d]
+    output_weight = target_lm_head_weight if t2d is None else target_lm_head_weight[t2d]
 
     bsz, seq_len, hidden_size = target_hidden_states.shape
-    loss_mask_bool = loss_mask.bool()
+    if loss_valid_idx is None:
+        if loss_mask is None:
+            raise ValueError("compute_target_p_padded requires loss_valid_idx or loss_mask")
+        loss_valid_idx = _pack_loss_mask_indices(loss_mask)
 
-    valid_flat_idx = loss_mask_bool.reshape(-1).nonzero(as_tuple=True)[0]
-    valid_hs = target_hidden_states.reshape(-1, hidden_size)[valid_flat_idx]
+    valid_hs = target_hidden_states.reshape(-1, hidden_size).index_select(0, loss_valid_idx)
+    candidate_valid = None
+    if t2d is not None:
+        candidate_valid = torch.empty(
+            loss_valid_idx.shape[0],
+            device=target_hidden_states.device,
+            dtype=torch.bool,
+        )
+        for i in range(0, valid_hs.shape[0], chunk_size):
+            chunk_hs = valid_hs[i : i + chunk_size]
+            chunk_argmax = F.linear(chunk_hs, target_lm_head_weight).argmax(-1)
+            candidate_valid[i : i + chunk_size] = t2d[chunk_argmax]
 
-    position_mask_flat = torch.zeros(
-        bsz * seq_len,
-        device=target_hidden_states.device,
-        dtype=torch.float,
+    if valid_hs.shape[0] <= chunk_size:
+        target_logits = F.linear(valid_hs, output_weight)
+        target_p = F.softmax(target_logits.float(), dim=-1)
+        target_argmax = target_logits.argmax(dim=-1)
+    else:
+        target_p = torch.empty(
+            (valid_hs.shape[0], output_weight.shape[0]),
+            device=valid_hs.device,
+            dtype=torch.float32,
+        )
+        target_argmax = torch.empty(
+            valid_hs.shape[0],
+            device=valid_hs.device,
+            dtype=torch.long,
+        )
+        for i in range(0, valid_hs.shape[0], chunk_size):
+            chunk_logits = F.linear(valid_hs[i : i + chunk_size], output_weight)
+            target_p[i : i + chunk_size].copy_(F.softmax(chunk_logits.float(), dim=-1))
+            target_argmax[i : i + chunk_size].copy_(chunk_logits.argmax(dim=-1))
+
+    return PrecomputedTarget(
+        target_p_padded=target_p,
+        candidate_valid=candidate_valid,
+        target_argmax=target_argmax,
     )
-    for i in range(0, valid_hs.shape[0], chunk_size):
-        chunk_hs = valid_hs[i : i + chunk_size]
-        chunk_argmax = F.linear(chunk_hs, target_lm_head_weight).argmax(-1)
-        in_draft = t2d[chunk_argmax]
-        position_mask_flat[valid_flat_idx[i : i + chunk_size]] = in_draft.float()
-    position_mask = position_mask_flat.reshape(bsz, seq_len)
-
-    target_logits_pruned = F.linear(target_hidden_states, pruned_weight)
-    target_p = F.softmax(target_logits_pruned.float(), dim=-1)
-    target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
-
-    return PrecomputedTarget(target_p_padded, position_mask)
 
 
 def compute_lazy_target_padded(
