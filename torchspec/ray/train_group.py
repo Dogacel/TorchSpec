@@ -135,6 +135,12 @@ class RayTrainGroup:
             [actor.train_from_queue.remote(step, num_batches) for actor in self._actor_handlers]
         )
 
+    def flush_pending_train_metrics(self):
+        """Materialize the final one-step-delayed metrics on every trainer."""
+        return ray.get(
+            [actor.flush_pending_train_metrics.remote() for actor in self._actor_handlers]
+        )
+
     def save_model(self, step, force_sync=False):
         """Save training model"""
         return ray.get(

@@ -39,6 +39,18 @@ from torchspec.controller.eval import (
 from torchspec.utils.logging import get_tb_writer, logger
 
 
+def _write_training_metrics(metrics: dict, train_step: int, inference_step: int) -> None:
+    if getattr(wandb, "run", None) is not None:
+        wandb.log(metrics)
+
+    tb_writer = get_tb_writer()
+    if tb_writer is not None:
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                scalar_step = inference_step if key.startswith("inference/") else train_step
+                tb_writer.add_scalar(key, value, scalar_step)
+
+
 def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines):
     """Sync draft model weights to inference engines (decode mode only)."""
     weight_sync_enabled = getattr(args, "decode_weight_sync_enabled", False)
@@ -238,6 +250,7 @@ def training_loop(
     consecutive_failures = 0
     queued_batches = 0
     last_saved_step: int | None = None
+    previous_dispatch_wait: float | None = None
     progress = tqdm(total=num_steps, desc="Training", unit="step", initial=start_step)
     while completed_steps < num_steps:
         remaining_steps = min(
@@ -315,6 +328,8 @@ def training_loop(
             # The current optimizer step is fully queued.
             if enable_perf:
                 dispatch_wait = time.time() - t_dispatch
+            else:
+                dispatch_wait = 0.0
 
             train_futures = [
                 actor.train_from_queue.remote(
@@ -330,9 +345,16 @@ def training_loop(
 
             # Log metrics from training (use rank 0's metrics - they're already all-reduced)
             metrics = train_results[0] if train_results and train_results[0] else {}
+            metric_step = int(metrics.pop("_metrics_step", completed_steps))
+            metric_dispatch_wait = (
+                previous_dispatch_wait
+                if metric_step != completed_steps and previous_dispatch_wait is not None
+                else dispatch_wait
+            )
+            previous_dispatch_wait = dispatch_wait
             if metrics:
                 # Add step counters for wandb x-axis (required in shared mode)
-                metrics["train/step"] = completed_steps
+                metrics["train/step"] = metric_step
                 metrics["inference/step"] = completed_steps
 
                 # Add inference metrics (e2e_latency, spec metrics, etc.)
@@ -340,34 +362,27 @@ def training_loop(
                 metrics.update(inference_metrics)
 
                 if enable_perf:
-                    metrics["perf/dispatch_wait"] = dispatch_wait
+                    metrics["perf/dispatch_wait"] = metric_dispatch_wait
                     step_time = metrics.get("perf/step_time", 0)
                     if step_time > 0:
                         metrics["perf/train_capacity"] = args.global_batch_size / step_time
 
-                    if completed_steps % 5 == 0 or completed_steps <= 5:
+                    if metric_step % 5 == 0 or metric_step <= 5:
                         data_t = metrics.get("perf/data_time", 0)
                         compute_t = metrics.get("perf/compute_time", 0)
                         fwd_t = metrics.get("perf/forward_time", 0)
                         bwd_t = metrics.get("perf/backward_time", 0)
                         opt_t = metrics.get("perf/optimizer_time", 0)
                         logger.info(
-                            f"TIMING step={completed_steps}: "
+                            f"TIMING step={metric_step}: "
                             f"step={step_time:.3f}s "
                             f"data={data_t:.3f}s "
                             f"compute={compute_t:.3f}s "
                             f"[fwd={fwd_t:.3f}s bwd={bwd_t:.3f}s opt={opt_t:.3f}s] "
-                            f"dispatch={dispatch_wait:.3f}s"
+                            f"dispatch={metric_dispatch_wait:.3f}s"
                         )
 
-                if getattr(wandb, "run", None) is not None:
-                    wandb.log(metrics)
-
-                tb_writer = get_tb_writer()
-                if tb_writer is not None:
-                    for key, value in metrics.items():
-                        if isinstance(value, (int, float)):
-                            tb_writer.add_scalar(key, value, completed_steps)
+                _write_training_metrics(metrics, metric_step, completed_steps)
 
             # ── Eval at explicit interval (if configured) ─────────
             # Skip if a checkpoint save is about to run (it will eval anyway)
@@ -447,6 +462,21 @@ def training_loop(
 
         # Inner while broke (max steps reached during reload), break outer loop
         break
+
+    final_train_results = train_group.flush_pending_train_metrics()
+    if not isinstance(final_train_results, (list, tuple)):
+        final_train_results = []
+    final_metrics = final_train_results[0] if final_train_results and final_train_results[0] else {}
+    if final_metrics:
+        final_metric_step = int(final_metrics.pop("_metrics_step", completed_steps))
+        final_metrics["train/step"] = final_metric_step
+        final_metrics["inference/step"] = completed_steps
+        if enable_perf and previous_dispatch_wait is not None:
+            final_metrics["perf/dispatch_wait"] = previous_dispatch_wait
+            step_time = final_metrics.get("perf/step_time", 0)
+            if step_time > 0:
+                final_metrics["perf/train_capacity"] = args.global_batch_size / step_time
+        _write_training_metrics(final_metrics, final_metric_step, completed_steps)
 
     progress.close()
 
