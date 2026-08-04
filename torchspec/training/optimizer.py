@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import torch
+import torch.distributed as dist
 
 from torchspec.training.lr_scheduler import LRSchedulerWithWarmup
 from torchspec.utils.logging import print_on_rank0
@@ -51,6 +52,10 @@ class BF16Optimizer:
             weight_decay=weight_decay,
             fused=True,
         )
+        if not getattr(self.optimizer, "_step_supports_amp_scaling", False):
+            raise RuntimeError(
+                "BF16Optimizer requires fused AdamW with device-side found_inf support"
+            )
         self.scheduler = LRSchedulerWithWarmup(
             self.optimizer,
             max_lr=lr,
@@ -85,6 +90,16 @@ class BF16Optimizer:
                 torch._foreach_copy_(grad_destinations, grad_sources)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
+
+        # Fused AdamW consumes this device scalar through the same path used by
+        # GradScaler. A nonzero value skips parameter, moment, weight-decay, and
+        # optimizer-step updates without synchronizing the CUDA scalar to Python.
+        found_inf = (~torch.isfinite(grad_norm)).to(dtype=torch.float32)
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            # A sharded rank may be the only one that observes a nonfinite
+            # gradient. All training ranks must make the same update decision.
+            dist.all_reduce(found_inf, op=dist.ReduceOp.MAX)
+        self.optimizer.found_inf = found_inf
         self.optimizer.step()
 
         self.optimizer.zero_grad()
