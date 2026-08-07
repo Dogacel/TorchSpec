@@ -160,7 +160,7 @@ class AsyncTrainingController:
         self._dataset_epoch: int = 0
         self._dataset_seed: int = getattr(args, "seed", 42)
         self._shuffle_dataset: bool = getattr(args, "shuffle_dataset", True)
-        self._length_group_size: int = getattr(args, "length_group_size", 1024)
+        self._length_group_size: int = getattr(args, "length_group_size", 32)
 
         self._start_time = time.time()
         self._inference_monitor = SpeedMonitor(window_seconds=10.0)
