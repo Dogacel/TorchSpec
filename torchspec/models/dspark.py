@@ -34,15 +34,13 @@ objective:
 Combined: ``ce_alpha*ce + l1_alpha*l1 + confidence_alpha*confidence``.
 
 Loss formulation adapted from DeepSeek's DeepSpec
-(deepspec/modeling/dspark/loss.py, MIT), including its pooled global-mean
-reduction: local numerators over a cross-rank all-reduced denominator, scaled
-by world_size to cancel FSDP's mean gradient reduction.
+(deepspec/modeling/dspark/loss.py, MIT). Additive loss terms are returned to
+the trainer so normalization covers every rank and gradient-accumulation step.
 """
 
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
 from torchspec.models.dflash import DFlashModel
@@ -93,16 +91,23 @@ class DSparkModel(DFlashModel):
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
         last_hidden_states: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict,
+        Tuple[torch.Tensor, torch.Tensor],
+    ]:
         """DSpark training forward.
 
-        Returns DFlashModel.forward's 5-tuple (loss, accuracy, loss_per_position,
-        acc_per_position, count_per_position) plus a 6th element: a dict of
-        detached per-component loss scalars (ce_loss / l1_loss / confidence_loss,
-        per-rank local means) for logging. ``loss`` is the combined
-        ce+l1+confidence objective; the per-position metrics are cross-entropy
-        based (acceptance proxy). DSparkTrainer unpacks the 6th element; the rest
-        of DFlash's aggregation is reused unchanged.
+        Returns DFlashModel.forward's metrics plus a dict of detached per-component
+        ``(numerator, denominator)`` pairs (ce_loss / l1_loss / confidence_loss) and
+        the additive loss terms. ``loss`` is the combined ce+l1+confidence
+        objective; the per-position metrics are cross-entropy based (acceptance
+        proxy). DSparkTrainer unpacks the extra elements; the rest of DFlash's
+        aggregation is reused unchanged.
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -215,30 +220,25 @@ class DSparkModel(DFlashModel):
             )
             conf_num = conf_bce.sum()
 
-        # ---- Pooled global loss (DeepSpec _build_loss) ----
-        # Local numerators over a cross-rank-summed denominator, x world_size to
-        # cancel FSDP's mean gradient reduction -> a true token-pooled global mean
-        # rather than a mean-of-per-rank-means.
-        # NOTE: uses the global training group size; correct for plain DP. With a
-        # multi-dim mesh (e.g. USP) the FSDP shard group differs from world_size.
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        global_den = local_den.detach().clone()
-        if world_size > 1:
-            dist.all_reduce(global_den, op=dist.ReduceOp.SUM)
-        global_den = global_den + 1e-6
-        loss = (
-            self.ce_loss_alpha * ce_num / global_den
-            + self.l1_loss_alpha * l1_num / global_den
-            + self.confidence_head_alpha * conf_num / global_den
-        ) * world_size
+        # The trainer pools these additive terms over the entire optimizer window
+        # before compensating for FSDP's mean gradient reduction.
+        loss_numerator = (
+            self.ce_loss_alpha * ce_num
+            + self.l1_loss_alpha * l1_num
+            + self.confidence_head_alpha * conf_num
+        )
+        loss = loss_numerator / local_den.clamp(min=1e-6)
 
-        # Per-component loss values (per-rank local means) for logging only —
-        # lets you watch L1 fall while the greedy-CE proxy plateaus.
-        local_den_eps = local_den + 1e-6
+        # Per-component terms for logging only — lets you watch L1 fall while the
+        # greedy-CE proxy plateaus. Reported as numerator/denominator rather than a
+        # local mean so the trainer can pool them over the same window as the
+        # objective; averaging per-micro-batch means would let these curves drift
+        # away from the loss actually optimized.
+        component_denominator = local_den.detach()
         loss_components = {
-            "ce_loss": (ce_num / local_den_eps).detach(),
-            "l1_loss": (l1_num / local_den_eps).detach(),
-            "confidence_loss": (conf_num / local_den_eps).detach(),
+            "ce_loss": (ce_num.detach(), component_denominator),
+            "l1_loss": (l1_num.detach(), component_denominator),
+            "confidence_loss": (conf_num.detach(), component_denominator),
         }
 
         # ---- Metrics (cross-entropy based; all block_size slots are productive) ----
@@ -262,4 +262,5 @@ class DSparkModel(DFlashModel):
             acc_per_position,
             count_per_position,
             loss_components,
+            (loss_numerator, local_den.detach()),
         )
