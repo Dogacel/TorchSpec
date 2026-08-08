@@ -108,45 +108,7 @@ class TargetLMHead(nn.Module):
         return instance
 
     def _load_lm_head(self, model_path: str, lm_head_key: str):
-        index_files = glob.glob(os.path.join(model_path, "*.index.json"))
-
-        if index_files:
-            with open(index_files[0], "r") as f:
-                index = json.load(f)
-            weight_map = index.get("weight_map", {})
-            if lm_head_key in weight_map:
-                file_path = os.path.join(model_path, weight_map[lm_head_key])
-                self._load_key_from_file(file_path, lm_head_key)
-            else:
-                raise KeyError(
-                    f"lm_head_key '{lm_head_key}' not found in weight_map. "
-                    f"Available keys: {list(weight_map.keys())[:10]}..."
-                )
-        else:
-            safetensors = glob.glob(os.path.join(model_path, "*.safetensors"))
-            bins = glob.glob(os.path.join(model_path, "*.bin"))
-            target_file = safetensors[0] if safetensors else (bins[0] if bins else None)
-            if target_file:
-                self._load_key_from_file(target_file, lm_head_key)
-            else:
-                raise FileNotFoundError(f"No checkpoint file found in {model_path}")
-
-    def _load_key_from_file(self, file_path: str, key: str):
-        tensor = None
-        if file_path.endswith(".safetensors"):
-            with safe_open(file_path, framework="pt") as f:
-                if key in f.keys():
-                    tensor = f.get_tensor(key)
-        else:
-            state_dict = torch.load(file_path, map_location="cpu")
-            if key in state_dict:
-                tensor = state_dict[key]
-                del state_dict
-
-        if tensor is not None:
-            self.lm_head.weight.data.copy_(tensor)
-        else:
-            raise KeyError(f"Key {key} not found in {file_path}")
+        self.lm_head.weight.data.copy_(self._load_tensor(model_path, lm_head_key))
 
     def _init_norm_structure(self) -> None:
         """Create the norm module structure (no weights loaded).
@@ -181,7 +143,7 @@ class TargetLMHead(nn.Module):
                 )
 
             self.norm = norm_module.to_empty(device="cpu")
-            self._load_key_into(model_path, norm_key, self.norm.weight)
+            self.norm.weight.data.copy_(self._load_tensor(model_path, norm_key))
 
         except Exception as e:
             self.norm = None
@@ -251,17 +213,16 @@ class TargetLMHead(nn.Module):
         del skeleton
         return norm_module
 
-    def _load_key_into(self, model_path: str, key: str, param: torch.nn.Parameter) -> None:
-        """Load a single key from safetensors/bin files into a parameter."""
+    def _load_tensor(self, model_path: str, key: str) -> torch.Tensor:
+        """Load one tensor from an indexed or single-file checkpoint."""
         index_files = glob.glob(os.path.join(model_path, "*.index.json"))
         if index_files:
             with open(index_files[0], "r") as f:
                 index = json.load(f)
             weight_map = index.get("weight_map", {})
-            if key in weight_map:
-                file_path = os.path.join(model_path, weight_map[key])
-            else:
+            if key not in weight_map:
                 raise KeyError(f"Key '{key}' not found in weight_map")
+            file_path = os.path.join(model_path, weight_map[key])
         else:
             safetensors = glob.glob(os.path.join(model_path, "*.safetensors"))
             bins = glob.glob(os.path.join(model_path, "*.bin"))
@@ -269,21 +230,17 @@ class TargetLMHead(nn.Module):
             if file_path is None:
                 raise FileNotFoundError(f"No checkpoint file found in {model_path}")
 
-        tensor = None
         if file_path.endswith(".safetensors"):
             with safe_open(file_path, framework="pt") as f:
                 if key in f.keys():
-                    tensor = f.get_tensor(key)
+                    return f.get_tensor(key)
         else:
             state_dict = torch.load(file_path, map_location="cpu")
             if key in state_dict:
                 tensor = state_dict[key]
                 del state_dict
-
-        if tensor is not None:
-            param.data.copy_(tensor)
-        else:
-            raise KeyError(f"Key {key} not found in {file_path}")
+                return tensor
+        raise KeyError(f"Key {key} not found in {file_path}")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute logits from hidden states."""

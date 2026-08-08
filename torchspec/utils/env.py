@@ -5,13 +5,22 @@ import os
 # use its own node-local default (/tmp/torchinductor_$USER/) to avoid
 # cross-node triton kernel cache corruption over NFS.
 _TORCHSPEC_ENV_KEYS = [
+    "CC",
+    "CUDA_HOME",
     "CUDA_LAUNCH_BLOCKING",
+    "CUDA_PATH",
+    "CXX",
+    "LD_LIBRARY_PATH",
+    "PYTHONPATH",
     "GLOO_SOCKET_IFNAME",
     "HF_HOME",
     "HF_TOKEN",
     "MC_LOG_LEVEL",
     "MODELOPT_MAX_TOKENS_PER_EXPERT",
     "NCCL_DEBUG",
+    "NCCL_IB_DISABLE",
+    "NCCL_IB_GID_INDEX",
+    "NCCL_IB_HCA",
     "NCCL_SOCKET_IFNAME",
     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN",
     "SGLANG_DISABLE_CUDNN_CHECK",

@@ -26,6 +26,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import urlparse
@@ -38,13 +39,23 @@ from torchspec.utils.logging import logger
 
 
 def resolve_mooncake_master_bin() -> str:
-    """Resolve the path to the mooncake_master binary."""
+    """Resolve the path to the mooncake_master binary.
+
+    Resolution order is explicit source build, executable PATH, active Python
+    environment, then the historical local source-build default.
+    """
     if "MOONCAKE_BUILD_DIR" in os.environ:
         return os.path.join(os.environ["MOONCAKE_BUILD_DIR"], "mooncake-store/src/mooncake_master")
 
     which_result = shutil.which("mooncake_master")
     if which_result:
         return which_result
+
+    # The packaged binary lives next to the Python executable in conda/pip envs.
+    # This covers non-activated interpreters without changing actor PATH.
+    env_bin_result = os.path.join(os.path.dirname(sys.executable), "mooncake_master")
+    if os.path.exists(env_bin_result):
+        return env_bin_result
 
     home = os.path.expanduser("~")
     return os.path.join(home, "build/mooncake-store/src/mooncake_master")

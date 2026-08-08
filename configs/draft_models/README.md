@@ -8,6 +8,7 @@ Architecture configurations for Eagle3 draft models. These define the model stru
 |--------|-------------|-------|
 | `qwen3_8b_eagle3.json` | Qwen3-8B | 1-layer LlamaForCausalLMEagle3, hidden_size=4096 |
 | `kimi_k25_eagle3.json` | Kimi-K2.5 | 1-layer LlamaForCausalLMEagle3, hidden_size=7168 |
+| `kimi_linear_48b_eagle3.json` | Kimi-Linear-48B-A3B | 1-layer LlamaForCausalLMEagle3, hidden_size=2304 |
 
 ## Usage
 

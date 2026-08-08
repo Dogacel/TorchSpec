@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import sys
 import tempfile
 from argparse import Namespace
 from unittest import mock
@@ -25,9 +26,22 @@ class TestResolveMooncakeMasterBin:
             result = resolve_mooncake_master_bin()
         assert result == "/usr/bin/mooncake_master"
 
+    def test_uses_active_python_env_if_available(self, monkeypatch):
+        monkeypatch.delenv("MOONCAKE_BUILD_DIR", raising=False)
+        expected = os.path.join(os.path.dirname(sys.executable), "mooncake_master")
+        with (
+            mock.patch("shutil.which", return_value=None),
+            mock.patch("os.path.exists", return_value=True),
+        ):
+            result = resolve_mooncake_master_bin()
+        assert result == expected
+
     def test_falls_back_to_default_path(self, monkeypatch):
         monkeypatch.delenv("MOONCAKE_BUILD_DIR", raising=False)
-        with mock.patch("shutil.which", return_value=None):
+        with (
+            mock.patch("shutil.which", return_value=None),
+            mock.patch("os.path.exists", return_value=False),
+        ):
             result = resolve_mooncake_master_bin()
         assert "build/mooncake-store/src/mooncake_master" in result
 

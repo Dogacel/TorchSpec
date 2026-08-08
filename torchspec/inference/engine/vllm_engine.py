@@ -184,6 +184,7 @@ class VllmEngine(InferenceEngine, RayActor):
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
         )
         _cfg = getattr(_outer_cfg, "text_config", _outer_cfg)
+        self._target_architectures = tuple(getattr(_cfg, "architectures", ()) or ())
 
         # Layer IDs use post-layer semantics: "capture the residual stream
         # after layer N runs".  vllm's capture hook fires at the INPUT of each
@@ -308,6 +309,18 @@ class VllmEngine(InferenceEngine, RayActor):
                 extra = {k: v for k, v in extra.items() if k not in _PROTECTION_ENGINE_KEYS}
             engine_kwargs.update(extra)
 
+        if (
+            "KimiLinearForCausalLM" in self._target_architectures
+            and "model_class_overrides" not in engine_kwargs
+        ):
+            engine_kwargs["model_class_overrides"] = {
+                "KimiLinearForCausalLM": (
+                    "torchspec.inference.engine.kimi_linear_eagle3:"
+                    "KimiLinearForCausalLMEagle3"
+                )
+            }
+            logger.info("Enabled EAGLE3 hidden-state capture for Kimi-Linear")
+
         inference_batch_size = getattr(self.args, "inference_batch_size", None)
         if inference_batch_size is not None:
             if "max_num_seqs" not in engine_kwargs:
@@ -340,7 +353,12 @@ class VllmEngine(InferenceEngine, RayActor):
 
         max_seq_length = getattr(self.args, "max_seq_length", None)
         if max_seq_length:
-            engine_kwargs["max_model_len"] = max_seq_length
+            # extract_hidden_states generates one speculative token after the
+            # prefill. Prompts exactly at the training limit therefore need
+            # one additional position in vLLM.
+            spec_cfg = engine_kwargs.get("speculative_config") or {}
+            num_spec_tokens = int(spec_cfg.get("num_speculative_tokens", 0))
+            engine_kwargs["max_model_len"] = int(max_seq_length) + num_spec_tokens
 
         if dist_init_addr:
             host, port_str = dist_init_addr.rsplit(":", 1)

@@ -25,6 +25,7 @@ python -m torchspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `sglang_qwen3_8b.yaml` | SGLang | Qwen3-8B | Single-node, 4+ GPUs |
 | `sglang_kimi_k25_2node.yaml` | SGLang | Kimi-K2.5 | 2-node H200, 16 GPUs |
 | `sglang_kimi_k25_3node.yaml` | SGLang | Kimi-K2.5 | 3-node H100, 24 GPUs |
+| `vllm_kimi_linear_48b.yaml` | vLLM | Kimi-Linear-48B-A3B | Single-node GB200/B200, 2 GPUs |
 
 ## Key sections
 

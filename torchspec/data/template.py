@@ -212,6 +212,16 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="kimi-linear",
+    template=ChatTemplate(
+        assistant_header="<|im_assistant|>assistant<|im_middle|>",
+        user_header="<|im_user|>user<|im_middle|>",
+        system_prompt=None,
+        end_of_turn_token="<|im_end|>",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="kimi-k25-vlm",
     template=ChatTemplate(
         assistant_header="<|im_assistant|>assistant<|im_middle|>",
