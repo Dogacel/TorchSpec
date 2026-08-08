@@ -26,6 +26,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import urlparse
@@ -45,6 +46,12 @@ def resolve_mooncake_master_bin() -> str:
     which_result = shutil.which("mooncake_master")
     if which_result:
         return which_result
+
+    # Ray actors may not inherit the driver's interactive-shell PATH.  The
+    # packaged binary lives next to the Python executable in our conda env.
+    env_bin_result = os.path.join(os.path.dirname(sys.executable), "mooncake_master")
+    if os.path.exists(env_bin_result):
+        return env_bin_result
 
     home = os.path.expanduser("~")
     return os.path.join(home, "build/mooncake-store/src/mooncake_master")

@@ -1,0 +1,71 @@
+# Kimi-Linear-48B-A3B-Instruct EAGLE3 training on two GB200/B200 GPUs.
+# GPU 0 trains the 836M-parameter draft; GPU 1 runs the TP1 target engine.
+
+model:
+  target_model_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
+  draft_model_config: configs/draft_models/kimi_linear_48b_eagle3.json
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.norm.weight
+  target_model_backend: vllm
+  trust_remote_code: true
+
+dataset:
+  train_data_path: examples/data/sample_conversations.jsonl
+  eval_data_path: examples/data/eval_conversations.jsonl
+  chat_template: kimi-linear
+  prompt_key: conversations
+  defer_tokenization: false
+  last_turn_loss_only: false
+  min_loss_tokens: 1
+  eval_interval: 100
+  eval_micro_batch_size: 1
+  length_group_size: 32
+
+training:
+  training_num_nodes: 1
+  training_num_gpus_per_node: 1
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.03
+  max_seq_length: 4096
+  num_epochs: 1
+  ttt_length: 4
+  ploss_weights: [1.0, 0.8, 0.64, 0.512]
+  gradient_checkpointing: false
+  save_interval: 500
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  inference_batch_size: 1
+  inference_buffer_threshold: 2
+  inference_fetch_batch: 2
+  max_sample_pool_size: 8
+  aux_hidden_states_layers: [1, 12, 23]
+  last_hidden_states_prenorm: true
+  vllm:
+    tp_size: 1
+    nnodes: 1
+    mem_fraction_static: 0.75
+    init_timeout: 1800
+    extra_args:
+      max_num_batched_tokens: 4097
+      enable_chunked_prefill: true
+      enforce_eager: true
+
+mooncake:
+  protocol: tcp
+  hidden_dim: 2304
+  max_seq_len: 4096
+  global_segment_size: 16GB
+  local_buffer_size: 8GB
+
+output_dir: ./outputs/kimi_linear_48b_eagle3
+cache_dir: ./cache/kimi_linear_48b_eagle3
+
+logging:
+  report_to: none

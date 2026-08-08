@@ -30,6 +30,23 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 
+class _GenericRMSNorm(nn.Module):
+    """Architecture-independent RMSNorm for remote-code model configs."""
+
+    def __init__(self, hidden_size: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.float().pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states.float() * torch.rsqrt(
+            variance + self.variance_epsilon
+        )
+        return self.weight * hidden_states.to(input_dtype)
+
+
 class TargetLMHead(nn.Module):
     """
     Efficiently loads only the lm_head from a pretrained model.
@@ -176,12 +193,22 @@ class TargetLMHead(nn.Module):
         """Instantiate the model on meta device and return the final norm module."""
         from transformers import AutoModelForCausalLM
 
-        with torch.device("meta"):
-            skeleton = AutoModelForCausalLM.from_config(
-                self.config,
-                trust_remote_code=True,
-                attn_implementation="eager",
-            )
+        try:
+            with torch.device("meta"):
+                skeleton = AutoModelForCausalLM.from_config(
+                    self.config,
+                    trust_remote_code=True,
+                    attn_implementation="eager",
+                )
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            # Remote model implementations can lag the installed Transformers
+            # API even though their config and safetensors remain usable by
+            # inference backends. RMSNorm only needs these config fields and
+            # the checkpoint weight loaded by the caller.
+            eps = getattr(self.config, "rms_norm_eps", None)
+            if eps is None:
+                raise
+            return _GenericRMSNorm(self.config.hidden_size, eps)
 
         inner = skeleton
         for attr in ("model", "language_model", "model"):
