@@ -30,6 +30,10 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torchspec.models.ops.loss import (
     compiled_forward_kl_loss,
     compiled_forward_kl_loss_from_hs,
+    compiled_lk_alpha_loss,
+    compiled_lk_alpha_loss_from_hs,
+    compiled_lk_lambda_loss,
+    compiled_lk_lambda_loss_from_hs,
     compiled_sum_forward_kl_loss_from_hs,
 )
 from torchspec.utils.distributed import (
@@ -44,8 +48,14 @@ from torchspec.utils.tensor import padding
 class PrecomputedTarget:
     """Pre-computed target probabilities (used with vocab pruning)."""
 
-    target_p_padded: torch.Tensor  # (B, T + length, V_draft)
+    target_p_padded: torch.Tensor  # (B, T + length, V_draft), renormalized over the draft vocab
     position_mask: Optional[torch.Tensor] = None  # (B, T)
+    # (B, T + length) draft-vocab probability mass under the *true*, full-vocab
+    # softmax (S = sum_{v in draft} p(v)). LK losses need the true, un-renormalized
+    # target probabilities (target_p_padded * coverage_padded) so that out-of-draft
+    # mass contributes 0 rather than being redistributed — see arXiv:2602.23881 §4.4.
+    # None when not computed (e.g. hand-built targets in tests); treated as 1.
+    coverage_padded: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -63,12 +73,22 @@ class Eagle3Model(nn.Module):
         length: int = 7,
         attention_backend="sdpa",
         gradient_checkpointing: bool = False,
+        loss_type: str = "forward_kl",
+        lk_eta: float = 3.0,
     ):
         super().__init__()
+        supported_loss_types = {"forward_kl", "lk_alpha", "lk_lambda"}
+        if loss_type not in supported_loss_types:
+            raise ValueError(
+                f"Unsupported Eagle3 loss_type={loss_type!r}; "
+                f"expected one of {sorted(supported_loss_types)}"
+            )
         self.draft_model = draft_model
         self.length = length
         self.attention_backend = attention_backend
         self.gradient_checkpointing = gradient_checkpointing
+        self.loss_type = loss_type
+        self.lk_eta = lk_eta
         self.vocab_pruning = draft_model.vocab_size != draft_model.target_vocab_size
         self._usp_sp_group = get_draft_sp_group() if attention_backend == "usp" else None
         self._usp_ulysses_group = get_sp_ulysses_group() if attention_backend == "usp" else None
@@ -77,6 +97,24 @@ class Eagle3Model(nn.Module):
             if self._usp_ulysses_group is not None
             else 1
         )
+
+    @staticmethod
+    def _coverage_flat(
+        target: PrecomputedTarget,
+        idx: int,
+        seq_length: int,
+        tp_flat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Flattened (B*T,) coverage for this depth's slice of ``target``.
+
+        Falls back to all-ones (no rescaling) when ``coverage_padded`` wasn't
+        computed, which is only the case for hand-built targets that don't
+        involve vocab pruning.
+        """
+        if target.coverage_padded is None:
+            return tp_flat.new_ones(tp_flat.shape[0])
+        coverage_step = target.coverage_padded[:, idx : idx + seq_length]
+        return coverage_step.reshape(-1)
 
     def _calculate_loss(
         self,
@@ -88,29 +126,43 @@ class Eagle3Model(nn.Module):
         norm_weight: torch.Tensor,
         lm_head_weight: torch.Tensor,
         norm_eps: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (loss_sum, correct_sum, count, alpha_sum).
+
+        ``alpha_sum`` (the LK acceptance-rate numerator) is a detached zero for
+        ``loss_type="forward_kl"``, which does not compute it.
+        """
         valid_idx = mask.flatten().nonzero().squeeze(-1)
         if valid_idx.numel() == 0:
             # FSDP requires every trainable param to participate in gradient
             # all-reduce/reduce-scatter.
             total = sum(p.reshape(-1)[0] for p in self.parameters() if p.requires_grad)
             zero = total * 0.0
-            return zero, zero.detach(), zero.detach()
+            return zero, zero.detach(), zero.detach(), zero.detach()
         # Important as it prevents recompilation.
         torch._dynamo.maybe_mark_dynamic(valid_idx, 0)
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        is_lk = self.loss_type in ("lk_alpha", "lk_lambda")
 
         if isinstance(target, PrecomputedTarget):
             target_p_step = target.target_p_padded[:, idx : idx + seq_length, :]
             tp_flat = target_p_step.reshape(-1, target_p_step.shape[-1])
             args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, norm_eps)
-            if self.gradient_checkpointing and self.training:
-                return torch_checkpoint(
-                    compiled_forward_kl_loss,
-                    *args,
-                    use_reentrant=False,
+            if self.loss_type == "lk_alpha":
+                fn = compiled_lk_alpha_loss
+                args = args + (self._coverage_flat(target, idx, seq_length, tp_flat),)
+            elif self.loss_type == "lk_lambda":
+                fn = compiled_lk_lambda_loss
+                args = args + (
+                    self._coverage_flat(target, idx, seq_length, tp_flat),
+                    self.lk_eta,
                 )
-            return compiled_forward_kl_loss(*args)
+            else:
+                fn = compiled_forward_kl_loss
+            if self.gradient_checkpointing and self.training:
+                result = torch_checkpoint(fn, *args, use_reentrant=False)
+            else:
+                result = fn(*args)
         else:
             ths_flat = target.hidden_states_padded[:, idx : idx + seq_length, :].reshape(
                 -1, target.lm_head_weight.shape[-1]
@@ -125,17 +177,26 @@ class Eagle3Model(nn.Module):
                 norm_eps,
             )
             use_sum_lazy_loss = self.attention_backend == "usp"
-            if self.gradient_checkpointing and self.training:
-                return torch_checkpoint(
+            if self.loss_type == "lk_alpha":
+                fn = compiled_lk_alpha_loss_from_hs
+            elif self.loss_type == "lk_lambda":
+                args = args + (self.lk_eta,)
+                fn = compiled_lk_lambda_loss_from_hs
+            else:
+                fn = (
                     compiled_sum_forward_kl_loss_from_hs
                     if use_sum_lazy_loss
-                    else compiled_forward_kl_loss_from_hs,
-                    *args,
-                    use_reentrant=False,
+                    else compiled_forward_kl_loss_from_hs
                 )
-            if use_sum_lazy_loss:
-                return compiled_sum_forward_kl_loss_from_hs(*args)
-            return compiled_forward_kl_loss_from_hs(*args)
+            if self.gradient_checkpointing and self.training:
+                result = torch_checkpoint(fn, *args, use_reentrant=False)
+            else:
+                result = fn(*args)
+
+        if is_lk:
+            return result
+        loss_sum, correct_sum, count = result
+        return loss_sum, correct_sum, count, count.new_zeros(())
 
     def forward(
         self,
@@ -146,7 +207,13 @@ class Eagle3Model(nn.Module):
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    ) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+    ]:
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
@@ -203,6 +270,7 @@ class Eagle3Model(nn.Module):
         vlosses = []
         acces = []
         acc_counts = []
+        alphas = []
         cache_keys = None
         cache_values = None
 
@@ -258,7 +326,7 @@ class Eagle3Model(nn.Module):
 
             hidden_states = hidden_states_out
 
-            local_sum_loss, local_correct, local_count = self._calculate_loss(
+            local_sum_loss, local_correct, local_count, local_alpha_sum = self._calculate_loss(
                 hidden_states=hidden_states,
                 target=target,
                 mask=step_mask,
@@ -282,6 +350,7 @@ class Eagle3Model(nn.Module):
             loss = local_sum_loss / local_count.clamp_min(1.0)
             metric_loss = loss.detach()
             metric_acc = (local_correct / local_count.clamp_min(1.0)).detach()
+            metric_alpha = (local_alpha_sum / local_count.clamp_min(1.0)).detach()
 
             if self._usp_sp_group is not None:
                 reduced_stats = torch.stack(
@@ -289,14 +358,20 @@ class Eagle3Model(nn.Module):
                         local_sum_loss.detach().clone().float(),
                         local_correct.detach().clone().float(),
                         local_count.detach().clone().float(),
+                        local_alpha_sum.detach().clone().float(),
                     )
                 )
                 dist.all_reduce(reduced_stats, op=dist.ReduceOp.SUM, group=self._usp_sp_group)
-                reduced_sum_loss, reduced_correct, reduced_count = reduced_stats.unbind()
+                reduced_sum_loss, reduced_correct, reduced_count, reduced_alpha_sum = (
+                    reduced_stats.unbind()
+                )
                 denom = reduced_count.clamp_min(1.0)
                 loss = (local_sum_loss / denom).to(loss.dtype)
                 metric_loss = (reduced_sum_loss / denom).detach()
                 metric_acc = (reduced_correct / denom).to(device=loss.device, dtype=torch.float32)
+                metric_alpha = (reduced_alpha_sum / denom).to(
+                    device=loss.device, dtype=torch.float32
+                )
                 metric_count = reduced_count.to(device=loss.device, dtype=torch.float32)
             else:
                 metric_count = local_count.detach().float().to(device=loss.device)
@@ -305,11 +380,12 @@ class Eagle3Model(nn.Module):
             vlosses.append(metric_loss)
             acces.append(metric_acc)
             acc_counts.append(metric_count)
+            alphas.append(metric_alpha)
 
             if not is_last:
                 input_ids = padding(input_ids, left=False)
                 mask = padding(mask, left=False)
-        return plosses, vlosses, acces, acc_counts
+        return plosses, vlosses, acces, acc_counts, alphas
 
 
 @torch.no_grad()
@@ -335,18 +411,41 @@ def compute_target_p_padded(
         device=target_hidden_states.device,
         dtype=torch.float,
     )
+    # Draft-vocab probability mass under the *true* full-vocab softmax at each
+    # valid position (S = sum_{v in draft} p(v)); lets LK losses undo the
+    # renormalization below and recover true, un-renormalized target
+    # probabilities. See ``PrecomputedTarget.coverage_padded``.
+    coverage_flat = torch.zeros(
+        bsz * seq_len,
+        device=target_hidden_states.device,
+        dtype=torch.float,
+    )
     for i in range(0, valid_hs.shape[0], chunk_size):
         chunk_hs = valid_hs[i : i + chunk_size]
-        chunk_argmax = F.linear(chunk_hs, target_lm_head_weight).argmax(-1)
+        chunk_full_logits = F.linear(chunk_hs, target_lm_head_weight)
+        chunk_argmax = chunk_full_logits.argmax(-1)
         in_draft = t2d[chunk_argmax]
         position_mask_flat[valid_flat_idx[i : i + chunk_size]] = in_draft.float()
+
+        # Reuse the already-materialized dense `pruned_weight` (boolean-indexed
+        # once, above) instead of boolean-masking `chunk_full_logits` by `t2d`
+        # here — masking a CUDA tensor by a bool index forces a device-to-host
+        # sync to read back the True-count, and that would otherwise happen
+        # once per chunk instead of once per call.
+        chunk_pruned_logits = F.linear(chunk_hs, pruned_weight)
+        full_logsumexp = torch.logsumexp(chunk_full_logits.float(), dim=-1)
+        pruned_logsumexp = torch.logsumexp(chunk_pruned_logits.float(), dim=-1)
+        coverage_flat[valid_flat_idx[i : i + chunk_size]] = torch.exp(
+            pruned_logsumexp - full_logsumexp
+        )
     position_mask = position_mask_flat.reshape(bsz, seq_len)
+    coverage_padded = F.pad(coverage_flat.reshape(bsz, seq_len), (0, length), value=0.0)
 
     target_logits_pruned = F.linear(target_hidden_states, pruned_weight)
     target_p = F.softmax(target_logits_pruned.float(), dim=-1)
     target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
 
-    return PrecomputedTarget(target_p_padded, position_mask)
+    return PrecomputedTarget(target_p_padded, position_mask, coverage_padded)
 
 
 def compute_lazy_target_padded(
