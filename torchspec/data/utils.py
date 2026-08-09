@@ -258,6 +258,8 @@ def resolve_loss_mask(
             input_ids = input_ids.squeeze(0)
         per_sample = data.get("last_turn_loss_only")
         last_turn_only = per_sample if per_sample is not None else last_turn_loss_only
+        if not isinstance(last_turn_only, bool):
+            last_turn_only = False
         mask = compute_assistant_loss_mask(
             input_ids,
             assistant_header_ids,
@@ -517,10 +519,25 @@ def load_hf_dataset(data_path: str):
 
     # hub path — try native load_dataset first (handles Arrow, Parquet, etc.),
     # fall back to manual JSON download for repos with mixed-type columns
-    _KEEP_COLUMNS = frozenset({"id", "conversations", "text", "messages"})
+    _KEEP_COLUMNS = frozenset(
+        {
+            "id",
+            "data_id",
+            "conversations",
+            "text",
+            "messages",
+            "tools",
+            "generation_config",
+        }
+    )
     try:
         ds = load_dataset(data_path, split="train", streaming=True)
-        drop_cols = [c for c in (ds.column_names or []) if c not in _KEEP_COLUMNS]
+        columns = ds.column_names or []
+        # A pretokenized repo's provenance columns cannot be enumerated ahead of
+        # time, and dropping input_ids would silently demote it to raw text.
+        if "input_ids" in columns:
+            return ds
+        drop_cols = [c for c in columns if c not in _KEEP_COLUMNS]
         if drop_cols:
             ds = ds.remove_columns(drop_cols)
         return ds
