@@ -38,6 +38,8 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
 
+from torchspec.config.utils import resolve_rope_theta
+
 
 class DFlashConfig(PretrainedConfig):
     """Configuration for DFlash draft model."""
@@ -59,6 +61,7 @@ class DFlashConfig(PretrainedConfig):
         target_hidden_size: int = 4096,
         target_num_hidden_layers: int = 36,
         target_layer_ids: Optional[List[int]] = None,
+        fc_norm: bool = False,
         mask_token_id: int = 151669,
         tie_word_embeddings: bool = False,
         **kwargs,
@@ -77,6 +80,7 @@ class DFlashConfig(PretrainedConfig):
         self.target_hidden_size = target_hidden_size
         self.target_num_hidden_layers = target_num_hidden_layers
         self.target_layer_ids = target_layer_ids
+        self.fc_norm = bool(fc_norm)
         self.mask_token_id = mask_token_id
 
 
@@ -187,7 +191,7 @@ class DFlashAttention(nn.Module):
         self.rotary_emb = DFlashRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
-            base=getattr(config, "rope_theta", 10000.0),
+            base=resolve_rope_theta(config),
         )
 
     def forward(
@@ -286,9 +290,12 @@ class DFlashMLP(nn.Module):
 class DFlashDecoderLayer(nn.Module):
     """Single transformer decoder layer for DFlash draft model."""
 
+    # Subclasses (e.g. K3 MLA) swap the attention implementation only.
+    attention_class = DFlashAttention
+
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.self_attn = DFlashAttention(config)
+        self.self_attn = self.attention_class(config)
         self.mlp = DFlashMLP(config)
         self.input_layernorm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -358,6 +365,7 @@ class DFlashDraftModel(PreTrainedModel):
     """
 
     config_class = DFlashConfig
+    decoder_layer_class = DFlashDecoderLayer
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
@@ -378,6 +386,15 @@ class DFlashDraftModel(PreTrainedModel):
 
         # Context feature projection: concat(multi-layer hidden) → hidden_size
         proj_input_dim = num_target_layers * target_hidden_size
+        if getattr(config, "fc_norm", False):
+            self.fc_norm = nn.ModuleList(
+                [
+                    DFlashRMSNorm(target_hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(num_target_layers)
+                ]
+            )
+        else:
+            self.fc_norm = None
         self.context_proj = nn.Linear(proj_input_dim, self.hidden_size, bias=False)
         self.context_norm = DFlashRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
@@ -385,7 +402,9 @@ class DFlashDraftModel(PreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
         # Decoder layers
-        self.layers = nn.ModuleList([DFlashDecoderLayer(config) for _ in range(self.num_layers)])
+        self.layers = nn.ModuleList(
+            [self.decoder_layer_class(config) for _ in range(self.num_layers)]
+        )
 
         # Final norm
         self.final_norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -399,6 +418,11 @@ class DFlashDraftModel(PreTrainedModel):
         Returns:
             context_feature: [B, seq_len, hidden_size]
         """
+        if self.fc_norm is not None:
+            all_hidden_states = [
+                norm(hidden_states)
+                for norm, hidden_states in zip(self.fc_norm, all_hidden_states, strict=True)
+            ]
         concatenated = torch.cat(all_hidden_states, dim=-1).to(self.context_proj.weight.dtype)
         projected = self.context_proj(concatenated)
         return self.context_norm(projected)
