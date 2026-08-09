@@ -213,67 +213,15 @@ class Eagle3Trainer(Trainer):
         Only rank 0 loads the weights, then broadcasts to other ranks.
         The lm_head is kept frozen and not wrapped with FSDP.
         """
-        from torchspec.models.target.target_utils import TargetLMHead
+        from torchspec.models.target.target_utils import load_synced_target_lm_head
 
-        if dist.get_rank() == 0:
-            self.target_lm_head = TargetLMHead.from_pretrained(
-                model_path=target_model_path,
-                lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
-                norm_key=getattr(self.args, "norm_key", "model.norm.weight"),
-                load_norm=self._last_hs_prenorm,
-                device="cuda",
-                dtype=torch.bfloat16,
-                trust_remote_code=getattr(self.args, "trust_remote_code", True),
-            )
-            logger.info(
-                f"[Rank 0] TargetLMHead loaded from {target_model_path}"
-                f"{' (with verifier norm)' if self._last_hs_prenorm else ''}"
-            )
-        else:
-            from transformers import AutoConfig
-
-            config = AutoConfig.from_pretrained(
-                target_model_path,
-                trust_remote_code=getattr(self.args, "trust_remote_code", True),
-            )
-            self.target_lm_head = TargetLMHead(config)
-            if self._last_hs_prenorm:
-                self.target_lm_head._init_norm_structure()
-            self.target_lm_head.to(device="cuda", dtype=torch.bfloat16)
-            self.target_lm_head.eval()
-            self.target_lm_head.requires_grad_(False)
-
-        # Sync norm status from rank 0 so all ranks have the same parameter count
-        # before the broadcast loop (prevents NCCL deadlock if norm loading
-        # silently failed on rank 0 but structure creation succeeded elsewhere).
-        has_norm = torch.tensor(
-            [self.target_lm_head.norm is not None], dtype=torch.int32, device="cuda"
+        self.target_lm_head = load_synced_target_lm_head(
+            target_model_path,
+            load_norm=self._last_hs_prenorm,
+            lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
+            norm_key=getattr(self.args, "norm_key", "model.norm.weight"),
+            trust_remote_code=getattr(self.args, "trust_remote_code", True),
         )
-        dist.broadcast(has_norm, src=0)
-        if has_norm.item():
-            if self.target_lm_head.norm is None:
-                logger.warning(
-                    f"[Rank {self.dp_rank}] Rank 0 has norm but this rank does not — "
-                    "this indicates _init_norm_structure failed; attempting recovery"
-                )
-                self.target_lm_head._init_norm_structure()
-                self.target_lm_head.norm = self.target_lm_head.norm.to(
-                    device="cuda", dtype=torch.bfloat16
-                )
-        else:
-            if self.target_lm_head.norm is not None:
-                logger.warning(
-                    f"[Rank {self.dp_rank}] Rank 0 does not have norm — "
-                    "removing norm on this rank to match"
-                )
-                self.target_lm_head.norm = None
-
-        dist.barrier()
-
-        for param in self.target_lm_head.parameters():
-            dist.broadcast(param.data, src=0)
-
-        logger.info(f"[Rank {self.dp_rank}] TargetLMHead initialized and synced")
 
     # ------------------------------------------------------------------
     # Forward / backward
