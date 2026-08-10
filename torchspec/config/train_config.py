@@ -84,6 +84,8 @@ class LoggingConfig:
 @dataclass
 class ModelConfig:
     draft_model_config: Optional[str] = None
+    initial_draft_model_path: Optional[str] = None
+    keep_initial_vocab_mapping: bool = False
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     norm_key: str = "model.norm.weight"
@@ -209,6 +211,7 @@ _ALWAYS_LOCAL_PATH_KEYS = (
     "cache_dir",
     "model_download_dir",
     "inference.offline.data_path",
+    "model.initial_draft_model_path",
 )
 _DATA_PATH_KEYS = ("dataset.train_data_path", "dataset.eval_data_path")
 
@@ -256,6 +259,21 @@ def _validate_vllm_config(config: DictConfig) -> None:
     for key, label in unsupported_flags.items():
         if OmegaConf.select(config, key):
             raise NotImplementedError(f"{label} is not yet supported with the vllm backend!")
+
+
+def _validate_vocab_mapping_config(config: DictConfig) -> None:
+    """Reusing a loaded vocabulary mapping requires weights that carry one."""
+    if not OmegaConf.select(config, "model.keep_initial_vocab_mapping"):
+        return
+    if not (
+        OmegaConf.select(config, "model.initial_draft_model_path")
+        or OmegaConf.select(config, "training.load_path")
+    ):
+        raise ValueError(
+            "model.keep_initial_vocab_mapping requires model.initial_draft_model_path or "
+            "training.load_path — without loaded weights there is no mapping to keep, and the "
+            "draft lm_head would be trained against an all-pass t2d."
+        )
 
 
 def _validate_offline_config(config: DictConfig) -> None:
@@ -318,6 +336,7 @@ def load_config(
 
     _validate_vllm_config(config)
     _validate_offline_config(config)
+    _validate_vocab_mapping_config(config)
 
     if save_snapshot:
         _save_config_snapshot(config)

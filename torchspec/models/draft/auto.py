@@ -86,6 +86,7 @@ class AutoDraftModelConfig:
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
         "DFlashDraftModel": DFlashConfig,
         "Qwen3DSparkModel": DSparkConfig,
+        "DSparkDraftModel": DSparkConfig,
         "K3DSparkModel": K3DSparkConfig,
     }
 

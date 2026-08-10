@@ -366,6 +366,8 @@ class DFlashDraftModel(PreTrainedModel):
 
     config_class = DFlashConfig
     decoder_layer_class = DFlashDecoderLayer
+    # See Eagle3DraftModel.all_tied_weights_keys.
+    all_tied_weights_keys = {}
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
