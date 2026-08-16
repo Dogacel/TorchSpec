@@ -98,23 +98,27 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      # mooncake-transfer-engine (a base dep, imported eagerly by
-      # torchspec.inference.engine) links CUDA driver/runtime libs. A GPU-less
-      # runner has none of them, so provide empty stubs with the right sonames;
-      # lazy symbol binding lets the import succeed (CUDA is never actually
-      # called in these CPU tests).
-      - name: Provide CUDA library stubs
-        run: |
-          sudo mkdir -p /opt/cuda-stub
-          for soname in libcuda.so.1 libcudart.so.12 libnvidia-ml.so.1; do
-            echo 'void _stub(void) {}' | cc -shared -fPIC -Wl,-soname,"$soname" -x c - -o "/opt/cuda-stub/$soname"
-          done
-          echo "LD_LIBRARY_PATH=/opt/cuda-stub:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-
       - name: Install CPU torch + dev deps + report tooling
         run: |
           uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system -e ".[dev]" pytest-html
+          # Real CUDA runtime (has the versioned cudaFreeHost etc. that
+          # mooncake's store.so resolves at load time).
+          uv pip install --system nvidia-cuda-runtime-cu12
+
+      # mooncake-transfer-engine (a base dep, imported eagerly by
+      # torchspec.inference.engine) links CUDA libs a GPU-less runner lacks.
+      # The driver lib (libcuda.so.1) only needs to be *present* — its symbols
+      # bind lazily and are never called here — so an empty stub suffices. The
+      # runtime lib needs real (versioned) symbols, so use the pip-installed one.
+      - name: Provide CUDA libs for mooncake import
+        run: |
+          sudo mkdir -p /opt/cuda-stub
+          for soname in libcuda.so.1 libnvidia-ml.so.1; do
+            echo 'void _stub(void) {}' | cc -shared -fPIC -Wl,-soname,"$soname" -x c - -o "/opt/cuda-stub/$soname"
+          done
+          cudart_dir="$(python -c 'import os, nvidia.cuda_runtime as m; print(os.path.join(os.path.dirname(m.__file__), "lib"))')"
+          echo "LD_LIBRARY_PATH=${cudart_dir}:/opt/cuda-stub:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - name: Run CPU-safe test suite
         run: |
