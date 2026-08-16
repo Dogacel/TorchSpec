@@ -117,7 +117,9 @@ jobs:
           for soname in libcuda.so.1 libnvidia-ml.so.1; do
             echo 'void _stub(void) {}' | cc -shared -fPIC -Wl,-soname,"$soname" -x c - -o "/opt/cuda-stub/$soname"
           done
-          cudart_dir="$(python -c 'import os, nvidia.cuda_runtime as m; print(os.path.join(os.path.dirname(m.__file__), "lib"))')"
+          # nvidia.cuda_runtime is a namespace package (__file__ is None), so
+          # locate its dir via __path__.
+          cudart_dir="$(python -c 'import os, nvidia.cuda_runtime as m; print(os.path.join(list(m.__path__)[0], "lib"))')"
           echo "LD_LIBRARY_PATH=${cudart_dir}:/opt/cuda-stub:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - name: Run CPU-safe test suite
