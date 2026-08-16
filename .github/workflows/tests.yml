@@ -1,4 +1,4 @@
-name: Tests (label-triggered)
+name: Tests
 
 # On-demand CI. Runs only when a user with WRITE access adds the `run-tests`
 # label to a PR (or via the manual "Run workflow" button). Nothing runs on
@@ -155,7 +155,6 @@ jobs:
               issue_number: ${{ needs.authorize.outputs.pr }}, name: 'run-tests',
             });
 
-      # Rich in-browser JUnit view as a PR check (pinned to v3.0.0).
       - name: Publish JUnit report as a check
         continue-on-error: true
         uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2  # v3.0.0
