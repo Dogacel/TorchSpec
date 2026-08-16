@@ -98,6 +98,17 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      # mooncake-transfer-engine (a base dep, imported eagerly by
+      # torchspec.inference.engine) links the CUDA *driver* lib. A GPU-less
+      # runner has no libcuda.so.1, so provide an empty stub with the right
+      # soname; lazy symbol binding lets the import succeed (the driver is
+      # never actually called in these CPU tests).
+      - name: Provide a libcuda.so.1 stub
+        run: |
+          sudo mkdir -p /opt/cuda-stub
+          echo 'void _stub(void) {}' | cc -shared -fPIC -Wl,-soname,libcuda.so.1 -x c - -o /opt/cuda-stub/libcuda.so.1
+          echo "LD_LIBRARY_PATH=/opt/cuda-stub:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
       - name: Install CPU torch + dev deps + report tooling
         run: |
           uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
@@ -138,6 +149,11 @@ jobs:
       statuses: write
       pull-requests: write
     steps:
+      # Base checkout (no PR code) gives dorny/test-reporter a git context.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Download reports
         continue-on-error: true
         uses: actions/download-artifact@v4
