@@ -1158,7 +1158,7 @@ class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
             direction="kv",
         )
 
-        out, lse = _flash_attn_fwd(
+        out, lse, *_rest = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1656,7 +1656,7 @@ def _standard_flash_attn_forward(
     softmax_scale: float,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    out, lse, _, _ = _std_flash_attn_forward(
+    out, lse, *_rest = _std_flash_attn_forward(
         q,
         k,
         v,
