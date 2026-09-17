@@ -22,6 +22,8 @@
 
 import math
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -1238,6 +1240,71 @@ class TestFlowSpecWrapper(unittest.TestCase):
                 "row_count",
             },
         )
+
+
+class TestFlowSpecTrainerCompatibility(unittest.TestCase):
+    def test_dispatch_selects_flowspec_trainer(self):
+        from torchspec.training.trainer_actor import _trainer_class_for_config
+
+        self.assertIs(_trainer_class_for_config(_make_config()), FlowSpecTrainer)
+
+    def test_forward_preserves_loss_and_metric_means_for_shared_trainer(self):
+        trainer = object.__new__(FlowSpecTrainer)
+        trainer.num_target_layers = 2
+        trainer.verifier_norm = lambda states: states * 2
+        trainer.target_lm_head_weight = torch.zeros(8, 4)
+        parameter = torch.nn.Parameter(torch.tensor(2.0))
+        loss = parameter.square()
+        counts = torch.tensor([0.0, 2.0, 2.0])
+        trainer.model = mock.Mock(
+            return_value=(
+                loss,
+                torch.tensor(0.5),
+                counts,
+                counts,
+                counts,
+                {"block_match_length": torch.tensor(1.5)},
+            )
+        )
+        batch = {
+            "input_ids": torch.zeros(1, 3, dtype=torch.long),
+            "hidden_states": torch.zeros(1, 3, 8),
+            "loss_mask": torch.ones(1, 3),
+            "last_hidden_states": torch.ones(1, 3, 4),
+        }
+        cpu = torch.device("cpu")
+        with mock.patch("torchspec.training.flowspec_trainer.torch.device", return_value=cpu):
+            result = trainer._forward(batch)
+        self.assertEqual(len(result), 7)
+        numerator, denominator = result[-1]
+        torch.testing.assert_close(numerator / denominator, loss)
+        trainer.optimizer = SimpleNamespace(model_params=[parameter])
+        trainer._backward(numerator, accumulation_steps=2)
+        trainer._normalize_accumulated_gradients(denominator, accumulation_steps=2)
+        torch.testing.assert_close(parameter.grad, torch.tensor(4.0))
+        self.assertEqual(
+            trainer._reduce_loss_components([result[-2]], "train/"),
+            {"train/block_match_length": 1.5},
+        )
+        torch.testing.assert_close(
+            trainer.model.call_args.kwargs["last_hidden_states"],
+            batch["last_hidden_states"] * 2,
+        )
+
+    def test_target_head_initialization_does_not_require_dflash_model(self):
+        for prenorm in (False, True):
+            with self.subTest(prenorm=prenorm):
+                trainer = object.__new__(FlowSpecTrainer)
+                trainer.args = SimpleNamespace()
+                trainer._last_hs_prenorm = prenorm
+                head = SimpleNamespace(norm=mock.sentinel.norm if prenorm else None)
+                with mock.patch(
+                    "torchspec.models.target.target_utils.load_synced_target_lm_head",
+                    return_value=head,
+                ) as load:
+                    trainer._init_target_lm_head("/unused/target")
+                self.assertEqual(load.call_args.kwargs["load_norm"], prenorm)
+                self.assertIs(trainer.verifier_norm, head.norm)
 
 
 class TestFlowSpecOdeEvalPartition(unittest.TestCase):

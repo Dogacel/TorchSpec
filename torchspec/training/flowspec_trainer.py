@@ -213,6 +213,18 @@ class FlowSpecTrainer(DFlashTrainer):
         logger.info(f"[Rank {self.dp_rank}] FlowSpec model initialized with FSDP2")
         return 0
 
+    def _init_target_lm_head(self, target_model_path: str) -> None:
+        from torchspec.models.target.target_utils import load_synced_target_lm_head
+
+        self.target_lm_head = load_synced_target_lm_head(
+            target_model_path,
+            load_norm=self._last_hs_prenorm,
+            lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
+            norm_key=getattr(self.args, "norm_key", "model.norm.weight"),
+            trust_remote_code=getattr(self.args, "trust_remote_code", True),
+        )
+        self.verifier_norm = self.target_lm_head.norm
+
     def _split_hidden_states(self, hidden_states: torch.Tensor) -> List[torch.Tensor]:
         total_dim = hidden_states.shape[-1]
         if total_dim % self.num_target_layers != 0:
@@ -225,7 +237,15 @@ class FlowSpecTrainer(DFlashTrainer):
     def _forward(
         self,
         batch: dict,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict,
+        Tuple[torch.Tensor, torch.Tensor],
+    ]:
         device = torch.device("cuda")
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         hidden_states = batch["hidden_states"].to(device, non_blocking=True)
@@ -241,16 +261,27 @@ class FlowSpecTrainer(DFlashTrainer):
                 "FlowSpec requires last_hidden_states. Set inference.store_last_hidden_states=true."
             )
         last_hidden_states = last_hidden_states.to(device, non_blocking=True)
+        if self.verifier_norm is not None:
+            with torch.no_grad():
+                last_hidden_states = self.verifier_norm(last_hidden_states)
 
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
-        return self.model(
+        loss, accuracy, loss_pp, acc_pp, count_pp, components = self.model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
             lm_head_weight=self.target_lm_head_weight,
             last_hidden_states=last_hidden_states,
         )
+        # FlowSpec's objective and metrics are already micro-batch means. Unit
+        # denominators preserve that averaging under the shared trainer's pooled
+        # loss/gradient contract, without changing the FLM objective weighting.
+        loss_terms = (loss, loss.detach().new_ones(()))
+        component_terms = {
+            key: (value.detach(), value.detach().new_ones(())) for key, value in components.items()
+        }
+        return loss, accuracy, loss_pp, acc_pp, count_pp, component_terms, loss_terms
 
     def _aggregate_ode_eval_metrics(
         self,
