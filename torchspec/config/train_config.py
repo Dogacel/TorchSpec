@@ -164,6 +164,9 @@ class TrainingConfig:
     dflash_ce_loss_alpha: float = 1.0
     dflash_l1_loss_alpha: float = 0.0
     dflash_num_anchors: int = 512
+    # Supervised positions between anchors: 0 gives adjacent, overlapping blocks.
+    # None preserves the shared sampler default gap of dflash_block_size.
+    dflash_anchor_max_gap: Optional[int] = None
     dflash_num_target_layers: int = 5
 
     # DFlash2-specific parameters (used by DFlash2 trainer only)
@@ -180,12 +183,25 @@ class TrainingConfig:
     # FlowSpec-specific parameters (used by FlowSpec trainer only)
     flowspec_block_size: int = 8
     flowspec_num_anchors: int = 512
+    # None preserves uniform sampling; 0 selects adjacent valid overlapping blocks.
+    flowspec_anchor_max_gap: Optional[int] = None
     flowspec_num_target_layers: int = 5
     flowspec_loss_decay_gamma: float = 7.0
+    # Clean state used for both corruption and loss supervision.
+    flowspec_endpoint_target: str = "teacher_distribution"
+    # Forward XM: select the lowest-loss noise per whole block during training.
+    flowspec_xm_best_of_k: int = 1
+    flowspec_loss_type: str = "cross_entropy"
+    flowspec_integral_time_weighting: bool = False
+    flowspec_target_distribution_anchor: bool = False
     flowspec_boundary_probability: float = 0.0
     flowspec_clean_deadline_jitter: float = 0.0
     flowspec_block_schedule_overlap: float = 1.0
     flowspec_use_diffusion_forcing_schedule: bool = True
+    flowspec_causal_attention: bool = False
+    flowspec_scratch_tokens: int = 0
+    flowspec_pretrained_embeddings_and_head: bool = False
+    flowspec_freeze_embeddings_and_head: bool = True
     flowspec_time_schedule: str = "simplex_sharp"
     flowspec_noise_type: str = "simplex"
     flowspec_self_condition_probability: float = 0.0

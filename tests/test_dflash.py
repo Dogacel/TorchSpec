@@ -63,6 +63,7 @@ def _make_dflash_model(
     num_anchors=4,
     loss_objective="decay",
     dpace_alpha=0.5,
+    anchor_max_gap=None,
 ):
     """Helper to create a DFlashModel for testing."""
     config = _make_config(
@@ -82,6 +83,7 @@ def _make_dflash_model(
         num_anchors=num_anchors,
         loss_objective=loss_objective,
         dpace_alpha=dpace_alpha,
+        anchor_max_gap=anchor_max_gap,
         loss_decay_gamma=7.0,
     )
 
@@ -231,6 +233,41 @@ class TestAnchorSampling(unittest.TestCase):
         self.assertEqual(anchors.shape[0], B)
         self.assertEqual(keep_mask.shape, anchors.shape)
         self.assertTrue(keep_mask.dtype == torch.bool)
+
+    def test_adjacent_anchors_supervise_overlapping_prediction_blocks(self):
+        seq_len, block_size, num_anchors = 8192, 8, 512
+        loss_mask = torch.ones(1, seq_len)
+        coverage = {}
+        for gap in (None, 0):
+            model = _make_dflash_model(
+                block_size=block_size, num_anchors=num_anchors, anchor_max_gap=gap
+            )
+            anchors, keep = model._sample_anchor_positions(seq_len, loss_mask, loss_mask.device)
+            self.assertEqual(anchors.shape, (1, num_anchors))
+            self.assertTrue(keep.all())
+            self.assertEqual(anchors.unique().numel(), num_anchors)
+            targets = anchors[keep].unsqueeze(1) + torch.arange(1, block_size)
+            coverage[gap] = torch.bincount(targets.flatten(), minlength=seq_len)
+        self.assertEqual(coverage[None].max().item(), 1)
+        self.assertEqual(coverage[0].max().item(), block_size - 1)
+        self.assertGreater((coverage[0] == block_size - 1).sum().item(), 480)
+
+    def test_adjacent_anchors_respect_supervised_spans_and_padding(self):
+        loss_mask = torch.zeros(2, 128)
+        loss_mask[0, 8:24] = 1
+        loss_mask[0, 64:80] = 1
+        model = _make_dflash_model(block_size=8, num_anchors=512, anchor_max_gap=0)
+        anchors, keep = model._sample_anchor_positions(128, loss_mask, loss_mask.device)
+        self.assertEqual(anchors.shape, (2, 512))
+        self.assertEqual(keep[0].sum().item(), 30)
+        self.assertFalse(keep[1].any())
+        self.assertEqual(anchors[0, keep[0]].unique().numel(), 30)
+        self.assertTrue((loss_mask.gather(1, anchors)[keep] == 1).all())
+        self.assertTrue((loss_mask.gather(1, anchors + 1)[keep] == 1).all())
+
+    def test_negative_anchor_gap_rejected(self):
+        with self.assertRaisesRegex(ValueError, "dflash_anchor_max_gap"):
+            _make_dflash_model(anchor_max_gap=-1)
 
     def test_sorted_order(self):
         B, seq_len = 1, 128
@@ -1194,6 +1231,7 @@ class TestDFlashTrainingConfig(unittest.TestCase):
         config = TrainingConfig()
         self.assertEqual(config.dflash_block_size, 16)
         self.assertEqual(config.dflash_num_anchors, 512)
+        self.assertIsNone(config.dflash_anchor_max_gap)
         self.assertEqual(config.dflash_loss_objective, "decay")
         self.assertEqual(config.dflash_dpace_alpha, 0.5)
         self.assertEqual(config.dflash_loss_decay_gamma, 7.0)
@@ -1212,6 +1250,7 @@ class TestDFlashTrainingConfig(unittest.TestCase):
         overrides = OmegaConf.from_dotlist(
             [
                 "training.dflash_block_size=8",
+                "training.dflash_anchor_max_gap=0",
                 "training.dflash_num_target_layers=3",
                 "training.dflash_loss_objective=dpace",
                 "training.dflash_dpace_alpha=0.3",
@@ -1219,6 +1258,7 @@ class TestDFlashTrainingConfig(unittest.TestCase):
         )
         merged = OmegaConf.merge(schema, overrides)
         self.assertEqual(merged.training.dflash_block_size, 8)
+        self.assertEqual(merged.training.dflash_anchor_max_gap, 0)
         self.assertEqual(merged.training.dflash_num_target_layers, 3)
         self.assertEqual(merged.training.dflash_loss_objective, "dpace")
         self.assertAlmostEqual(merged.training.dflash_dpace_alpha, 0.3)

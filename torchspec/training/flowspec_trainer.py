@@ -25,6 +25,7 @@ from typing import List, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.distributed.fsdp import register_fsdp_forward_method
 
 from torchspec.models.draft.flowspec import FlowSpecConfig, FlowSpecDraftModel
 from torchspec.models.flowspec import FlowSpecModel
@@ -50,12 +51,19 @@ class FlowSpecTrainer(DFlashTrainer):
     """Train a dense-vocabulary FLM using cached target-model hidden states."""
 
     _anchor_slot_offset = 1
-    _extra_loss_component_keys = ["block_match_length"]
+    _extra_loss_component_keys = [
+        "block_match_length",
+        "xm_first_candidate_loss",
+        "xm_selected_loss",
+        "xm_selection_gain",
+        "xm_nonfirst_fraction",
+    ]
 
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.block_size = getattr(args, "flowspec_block_size", 8)
         self.num_anchors = getattr(args, "flowspec_num_anchors", 512)
+        self.anchor_max_gap = getattr(args, "flowspec_anchor_max_gap", None)
         self.num_target_layers = getattr(args, "flowspec_num_target_layers", 5)
         self.loss_decay_gamma = getattr(args, "flowspec_loss_decay_gamma", 7.0)
         self.boundary_probability = getattr(
@@ -70,6 +78,8 @@ class FlowSpecTrainer(DFlashTrainer):
             "flowspec_use_diffusion_forcing_schedule",
             True,
         )
+        self.causal_attention = getattr(args, "flowspec_causal_attention", False)
+        self.scratch_tokens = getattr(args, "flowspec_scratch_tokens", 0)
         self.time_schedule = getattr(args, "flowspec_time_schedule", "simplex_sharp")
         self.noise_type = getattr(args, "flowspec_noise_type", "simplex")
         self.self_condition_probability = getattr(
@@ -107,6 +117,16 @@ class FlowSpecTrainer(DFlashTrainer):
                     "FlowSpecConfig."
                 )
             config.self_conditioning = self.self_condition_probability > 0.0
+            config.pretrained_embeddings_and_head = getattr(
+                self.args, "flowspec_pretrained_embeddings_and_head", False
+            )
+            config.freeze_embeddings_and_head = getattr(
+                self.args, "flowspec_freeze_embeddings_and_head", True
+            )
+            config.scratch_tokens = self.scratch_tokens
+            config.flow_block_size = self.block_size
+            if not isinstance(self.scratch_tokens, int) or self.scratch_tokens < 0:
+                raise ValueError("flowspec_scratch_tokens must be a non-negative integer")
 
             if config.num_target_layers != self.num_target_layers:
                 raise ValueError(
@@ -114,6 +134,29 @@ class FlowSpecTrainer(DFlashTrainer):
                     f"got {self.num_target_layers} and {config.num_target_layers}."
                 )
             draft_model = FlowSpecDraftModel(config)
+
+        if config.pretrained_embeddings_and_head:
+            load_error = [None]
+            if dist.get_rank() == 0:
+                try:
+                    draft_model.load_pretrained_embeddings_and_head(
+                        target_model_path,
+                        embedding_key=getattr(
+                            self.args, "embedding_key", "model.embed_tokens.weight"
+                        ),
+                        lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
+                    )
+                except Exception as exc:
+                    load_error[0] = f"{type(exc).__name__}: {exc}"
+            dist.broadcast_object_list(load_error, src=0, group=get_gloo_group())
+            if load_error[0] is not None:
+                raise RuntimeError(
+                    f"FlowSpec pretrained vocabulary loading failed: {load_error[0]}"
+                )
+            logger.info(
+                "FlowSpec uses pretrained target embeddings and LM head (frozen=%s)",
+                config.freeze_embeddings_and_head,
+            )
 
         draft_model = draft_model.to(torch.bfloat16)
         dist.barrier(group=get_gloo_group())
@@ -127,6 +170,8 @@ class FlowSpecTrainer(DFlashTrainer):
             draft_model=draft_model,
             block_size=self.block_size,
             num_anchors=self.num_anchors,
+            anchor_max_gap=self.anchor_max_gap,
+            causal_attention=self.causal_attention,
             loss_decay_gamma=self.loss_decay_gamma,
             boundary_probability=self.boundary_probability,
             clean_deadline_jitter=self.clean_deadline_jitter,
@@ -136,6 +181,11 @@ class FlowSpecTrainer(DFlashTrainer):
             noise_type=self.noise_type,
             self_condition_probability=self.self_condition_probability,
             use_flex_attention=getattr(self.args, "attention_backend", "sdpa") == "flex_attention",
+            endpoint_target=getattr(self.args, "flowspec_endpoint_target", "teacher_distribution"),
+            xm_best_of_k=getattr(self.args, "flowspec_xm_best_of_k", 1),
+            loss_type=getattr(self.args, "flowspec_loss_type", "cross_entropy"),
+            integral_time_weighting=getattr(self.args, "flowspec_integral_time_weighting", False),
+            target_distribution_anchor=getattr(self.args, "flowspec_target_distribution_anchor", False),
         )
         full_state = flowspec_model.state_dict() if dist.get_rank() == 0 else {}
 
@@ -152,6 +202,10 @@ class FlowSpecTrainer(DFlashTrainer):
             self.dp_mesh,
             cpu_offload=True if self.fsdp_cpu_offload else None,
         )
+
+        # ODE evaluation bypasses forward(), but still needs FSDP's parameter
+        # all-gather hooks after checkpoint saving or loading reshards the weights.
+        register_fsdp_forward_method(flowspec_model, "evaluate_integrated")
 
         if getattr(self.args, "compile_model", False):
             logger.info("Compiling FlowSpec model with torch.compile (inductor backend)")
@@ -388,6 +442,16 @@ class FlowSpecTrainer(DFlashTrainer):
                 hidden_states_list = self._split_hidden_states(hidden_states)
                 del hidden_states
 
+                target_kwargs = {}
+                if self.flowspec.target_distribution_anchor:
+                    last_hidden = batch["last_hidden_states"].cuda()
+                    if self.verifier_norm is not None:
+                        last_hidden = self.verifier_norm(last_hidden)
+                    target_kwargs = dict(
+                        last_hidden_states=last_hidden,
+                        lm_head_weight=self.target_lm_head_weight,
+                    )
+
                 all_metrics.append(
                     self.flowspec.evaluate_integrated(
                         input_ids=input_ids,
@@ -395,6 +459,7 @@ class FlowSpecTrainer(DFlashTrainer):
                         loss_mask=loss_mask,
                         num_steps=num_steps,
                         generator=generator,
+                        **target_kwargs,
                     )
                 )
         finally:

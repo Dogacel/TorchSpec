@@ -54,6 +54,7 @@ class DFlash2Trainer(DFlashTrainer):
             draft_model=draft_model,
             block_size=self.block_size,
             num_anchors=self.num_anchors,
+            anchor_max_gap=self.anchor_max_gap,
             loss_objective=self.loss_objective,
             dpace_alpha=self.dpace_alpha,
             loss_decay_gamma=self.loss_decay_gamma,

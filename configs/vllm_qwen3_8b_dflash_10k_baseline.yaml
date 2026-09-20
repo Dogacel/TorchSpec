@@ -1,0 +1,92 @@
+# DFlash baseline on the balanced Qwen3-8B regenerated PerfectBlend split.
+# 6 training GPUs + 2 vLLM target replicas; global batch = 2 * 6 * 2 = 24.
+# Launch from the repository root:
+#   python -m torchspec.train_entry --config configs/vllm_qwen3_8b_dflash_10k_baseline.yaml
+# W&B authentication comes from WANDB_API_KEY in the environment.
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+  draft_model_config: torchspec/config/dflash_draft_config.json
+
+dataset:
+  train_data_path: ../data/perfectblend_balanced_10k/qwen3_8b_regen/train.jsonl
+  eval_data_path: ../data/perfectblend_balanced_10k/qwen3_8b_regen/eval.jsonl
+  eval_interval: 250
+  eval_micro_batch_size: 1
+  chat_template: qwen3-thinking
+  prompt_key: conversations
+  min_loss_tokens: 16
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 2
+  draft_accumulation_steps: 2
+  learning_rate: 6e-4
+  min_lr: 6e-5
+  lr_decay_style: WSD
+  lr_wsd_decay_ratio: 0.2
+  lr_wsd_decay_style: cosine
+  weight_decay: 0.01
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 8192
+  num_epochs: 5
+  seed: 42
+  eval_seed: 1234
+  eval_at_start: true
+  training_num_gpus_per_node: 6
+  training_num_nodes: 1
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 500
+  save_per_epoch: true
+  max_checkpoints: 3
+  warmup_ratio: 0.04
+
+  dflash_block_size: 8
+  dflash_num_anchors: 512
+  # Adjacent eligible positions, allowing overlapping prediction blocks.
+  dflash_anchor_max_gap: 0
+  dflash_loss_objective: decay
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 5
+
+inference:
+  inference_engine_type: vllm
+  store_last_hidden_states: false
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  vllm:
+    tp_size: 1
+    mem_fraction_static: 0.7
+    extra_args:
+      max_model_len: 16384
+      max_num_batched_tokens: 8192
+
+logging:
+  report_to: wandb
+  use_tensorboard: false
+  use_wandb: true
+  wandb_mode: online
+  wandb_dir: /storage/dogac/TorchSpec/wandb
+  wandb_project: qwen3-8b-dflash-flow
+  wandb_group: qwen3-8b-dflash-10k-overlap512
+  wandb_random_suffix: false
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 32GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+
+output_dir: /storage/dogac/TorchSpec/outputs/qwen3-8b-dflash-10k-overlap512
+cache_dir: /storage/dogac/TorchSpec/cache/qwen3-8b-dflash-10k-overlap512
+model_download_dir: /storage/dogac/huggingface/hub

@@ -136,6 +136,25 @@ class TestEagle3TrainerAggregation(unittest.TestCase):
         self.assertNotAlmostEqual(metrics["train/acc_0"], naive_mean, places=3)
 
 
+def test_aggregate_metrics_accepts_distributed_grad_norm(tmp_path):
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        grad_norm = DTensor.from_local(torch.tensor(3.0), mesh, [Replicate()])
+        trainer = TestEagle3TrainerAggregation._make_trainer()
+        with mock.patch("torchspec.training.eagle3_trainer.dist.all_reduce"):
+            metrics = trainer._aggregate_metrics(_step_metrics(), step=11, grad_norm=grad_norm)
+        assert metrics["train/grad_norm"] == 3.0
+        assert abs(metrics["train/avg_loss"] - 7.0 / 3.0) < 1e-6
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 class TestEagle3TrainerEvalAggregation(unittest.TestCase):
     @staticmethod
     def _make_trainer():

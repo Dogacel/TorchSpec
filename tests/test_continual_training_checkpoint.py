@@ -19,6 +19,9 @@ class DummyBF16Optimizer:
             weight_decay=weight_decay,
         )
 
+    def state_dict(self):
+        return self.optimizer.state_dict()
+
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict)
 
@@ -156,3 +159,31 @@ def test_optimizer_continuation_preserves_global_step_with_fresh_scheduler():
         Path("/tmp/fake_optim"),
         reset_optimizer=False,
     )
+
+
+def test_real_dcp_load_restores_lazy_adam_state_and_next_update(tmp_path):
+    source = DummyBF16Optimizer(lr=0.001, betas=(0.9, 0.99), weight_decay=0.01)
+    parameter = source.fp32_params[0]
+    parameter.data.fill_(42.0)
+    source.optimizer.state[parameter].update(
+        step=torch.tensor(416.0), exp_avg=torch.tensor([2.0]), exp_avg_sq=torch.tensor([3.0])
+    )
+    checkpoint.dcp.save(
+        {"optim_state": checkpoint.OptimizerState(source.model, source)},
+        checkpoint_id=str(tmp_path),
+    )
+    restored = DummyBF16Optimizer(lr=0.123, betas=(0.7, 0.8), weight_decay=0.456)
+    assert not restored.optimizer.state
+    checkpoint.dcp.load(
+        {"optim_state": checkpoint.OptimizerState(restored.model, restored, tmp_path)},
+        checkpoint_id=str(tmp_path),
+    )
+    actual = restored.optimizer.state[restored.fp32_params[0]]
+    for key, expected in source.optimizer.state[parameter].items():
+        torch.testing.assert_close(actual[key], expected, rtol=0, atol=0)
+    torch.testing.assert_close(restored.fp32_params[0], parameter, rtol=0, atol=0)
+    for optimizer in (source, restored):
+        optimizer.fp32_params[0].grad = torch.tensor([0.25])
+        optimizer.optimizer.step()
+    torch.testing.assert_close(restored.fp32_params[0], parameter, rtol=0, atol=0)
+    assert actual["step"].item() == 417

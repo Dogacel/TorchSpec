@@ -124,6 +124,7 @@ class DFlashModel(nn.Module):
         loss_decay_gamma: float = 7.0,
         ce_loss_alpha: float = 1.0,
         l1_loss_alpha: float = 0.0,
+        anchor_max_gap: Optional[int] = None,
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -135,9 +136,13 @@ class DFlashModel(nn.Module):
         if not 0.0 <= dpace_alpha <= 1.0:
             raise ValueError(f"dflash_dpace_alpha must be in [0, 1], got {dpace_alpha}")
 
+        if anchor_max_gap is not None and anchor_max_gap < 0:
+            raise ValueError("dflash_anchor_max_gap must be nonnegative or None")
+
         self.draft_model = draft_model
         self.block_size = block_size
         self.num_anchors = num_anchors
+        self.anchor_max_gap = anchor_max_gap
         self.loss_objective = loss_objective
         self.dpace_alpha = dpace_alpha
         self.loss_decay_gamma = loss_decay_gamma
@@ -155,7 +160,12 @@ class DFlashModel(nn.Module):
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return sample_anchor_positions(
-            seq_len, loss_mask, self.num_anchors, self.block_size, device
+            seq_len,
+            loss_mask,
+            self.num_anchors,
+            self.block_size,
+            device,
+            max_gap=self.anchor_max_gap,
         )
 
     def _create_position_ids(

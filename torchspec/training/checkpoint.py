@@ -61,16 +61,20 @@ def _fp32_param_names(optimizer) -> list[str]:
 class OptimizerState(Stateful):
     """Wrapper for optimizer + fp32 master params."""
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, checkpoint_dir: Path | None = None):
         self.model = model
         self.optimizer = optimizer
+        self.checkpoint_dir = checkpoint_dir
         self._is_bf16_optimizer = hasattr(optimizer, "sync_fp32_params_from_model")
 
     def state_dict(self):
         if self._is_bf16_optimizer:
             names = _fp32_param_names(self.optimizer)
+            optimizer_state = self.optimizer.state_dict()
+            if self.checkpoint_dir is not None:
+                self._prepare_optimizer_load_state(optimizer_state)
             return {
-                "optim": self.optimizer.state_dict(),
+                "optim": optimizer_state,
                 # Keyed by name: which parameters are trainable can differ between the run
                 # that saved and the run that loads.
                 "fp32_params": {
@@ -81,9 +85,49 @@ class OptimizerState(Stateful):
         _, optimizer_state_dict = get_state_dict(self.model, optimizers=[self.optimizer])
         return {"optim": optimizer_state_dict}
 
+    def _prepare_optimizer_load_state(self, state_dict: dict) -> None:
+        # DCP only loads keys present in the destination state dict. Adam creates
+        # its moments lazily, so a fresh optimizer would silently skip them all.
+        # Allocate only states actually present in the checkpoint, preserving
+        # DTensor placement for moment buffers and not taking a dummy update.
+        metadata = dcp.FileSystemReader(str(self.checkpoint_dir)).read_metadata()
+        parameters = {}
+        for saved_group, live_group in zip(
+            state_dict["param_groups"], self.optimizer.optimizer.param_groups, strict=True
+        ):
+            parameters.update(zip(saved_group["params"], live_group["params"], strict=True))
+        for key, path in metadata.planner_data.items():
+            if len(path) != 5 or tuple(path[:3]) != ("optim_state", "optim", "state"):
+                continue
+            parameter_id, field = int(path[3]), path[4]
+            if parameter_id not in parameters:
+                raise ValueError(f"Checkpoint optimizer parameter {parameter_id} is missing")
+            state = state_dict["state"].setdefault(parameter_id, {})
+            if field in state:
+                continue
+            stored = metadata.state_dict_metadata[key]
+            parameter = parameters[parameter_id]
+            if not isinstance(stored, dcp.TensorStorageMetadata):
+                raise ValueError(f"Unsupported non-tensor optimizer state: {key}")
+            if field == "step" and stored.size == torch.Size([]):
+                state[field] = torch.empty(
+                    (), dtype=stored.properties.dtype, device=parameter.device
+                )
+            elif stored.size == parameter.shape:
+                state[field] = torch.empty_like(parameter, dtype=stored.properties.dtype)
+            else:
+                raise ValueError(f"Optimizer state shape mismatch for {key}: {stored.size}")
+
     def load_state_dict(self, state_dict):
         if self._is_bf16_optimizer:
             self.optimizer.load_state_dict(state_dict["optim"])
+            loaded_states = self.optimizer.optimizer.state.values()
+            steps = [float(state["step"].item()) for state in loaded_states if "step" in state]
+            if steps:
+                logger.info(
+                    f"Restored optimizer moments for {len(steps)} parameters "
+                    f"(step range {min(steps):g}..{max(steps):g})"
+                )
             saved = state_dict.get("fp32_params")
             if saved:
                 names = _fp32_param_names(self.optimizer)
@@ -236,7 +280,7 @@ def load(actor: Any) -> dict[str, Any] | None:
     # Keep optimizer/LR state out of continual training so it starts fresh.
     load_optimizer = not continual_training and hasattr(actor, "optimizer")
     if load_optimizer and optimizer_dir.exists():
-        optimizer_state = OptimizerState(actor.model, actor.optimizer)
+        optimizer_state = OptimizerState(actor.model, actor.optimizer, optimizer_dir)
         optim_state_dict = {"optim_state": optimizer_state}
         try:
             dcp.load(state_dict=optim_state_dict, checkpoint_id=str(optimizer_dir))
@@ -319,7 +363,7 @@ def _restore_fp32_master_params(
                 {key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
                 for group in opt.optimizer.param_groups
             ]
-            optim_state = OptimizerState(actor.model, opt)
+            optim_state = OptimizerState(actor.model, opt, optim_dir)
             optim_sd = {"optim_state": optim_state}
             dcp.load(state_dict=optim_sd, checkpoint_id=str(optim_dir))
             for group, fresh_group in zip(opt.optimizer.param_groups, fresh_param_groups):

@@ -137,6 +137,7 @@ Key hyperparameters in `configs/sglang_qwen3_8b_dflash.yaml`:
 | `fsdp_strategy` | FULL_SHARD | Shards params + optimizer |
 | `dflash_block_size` | 16 | Block-parallel prediction size |
 | `dflash_num_anchors` | 512 | Anchor positions per sequence |
+| `dflash_anchor_max_gap` | `null` | Max supervised positions between anchors; `0` gives adjacent anchors with overlapping prediction blocks |
 | `save_interval` | 1000 | Checkpoint every N steps |
 
 Expected throughput: **~5 step/s** (~15 samples/sec) on 4x H100.

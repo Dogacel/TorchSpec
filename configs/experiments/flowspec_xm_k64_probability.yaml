@@ -1,0 +1,96 @@
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+  draft_model_config: /home/dogac/TorchSpec/torchspec/config/flowspec_draft_config.json
+dataset:
+  train_data_path: /home/dogac/TorchSpec/data/perfectblend_balanced_10k/qwen3_8b_regen/train.jsonl
+  eval_data_path: /home/dogac/TorchSpec/data/perfectblend_balanced_10k/qwen3_8b_regen/eval.jsonl
+  eval_interval: 250
+  eval_micro_batch_size: 1
+  chat_template: qwen3-thinking
+  prompt_key: conversations
+  min_loss_tokens: 16
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 2
+  draft_accumulation_steps: 2
+  learning_rate: 0.0001
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 8192
+  num_epochs: 5
+  seed: 42
+  training_num_gpus_per_node: 6
+  training_num_nodes: 1
+  save_per_epoch: true
+  warmup_ratio: 0.015
+  lr_decay_style: cosine
+  min_lr: 0.0
+  eval_seed: 1234
+  eval_at_start: true
+  save_interval: 500
+  max_checkpoints: 3
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  flowspec_block_size: 8
+  flowspec_num_anchors: 512
+  flowspec_num_target_layers: 5
+  flowspec_loss_decay_gamma: 7.0
+  flowspec_boundary_probability: 0.03125
+  flowspec_clean_deadline_jitter: 0.0
+  flowspec_block_schedule_overlap: 2.0
+  flowspec_use_diffusion_forcing_schedule: false
+  flowspec_time_schedule: soft_target_argmax_uniform_blend
+  flowspec_noise_type: standard_gaussian
+  flowspec_self_condition_probability: 0.5
+  flowspec_ode_eval_max_samples: 96
+  flowspec_ode_eval_seed: 1234
+  flowspec_ode_eval_step_counts:
+  - 1
+  - 2
+  - 32
+  flowspec_ode_eval_steps: 0
+  flowspec_anchor_max_gap: 0
+  weight_decay: 0.0
+  flowspec_pretrained_embeddings_and_head: true
+  flowspec_freeze_embeddings_and_head: true
+  flowspec_xm_best_of_k: 64
+  flowspec_endpoint_target: teacher_distribution
+  flowspec_loss_type: cross_entropy
+  flowspec_integral_time_weighting: false
+  flowspec_target_distribution_anchor: false
+inference:
+  inference_engine_type: vllm
+  store_last_hidden_states: true
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  vllm:
+    tp_size: 1
+    mem_fraction_static: 0.7
+    extra_args:
+      max_model_len: 16384
+      max_num_batched_tokens: 8192
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 32GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+output_dir: /storage/dogac/TorchSpec/outputs/qwen3-8b-flowspec-xm-k64-probability-5ep
+cache_dir: /storage/dogac/TorchSpec/cache/qwen3-8b-flowspec-10k-overlap512-5ep
+model_download_dir: /storage/dogac/huggingface/hub
+logging:
+  report_to: wandb
+  use_tensorboard: false
+  use_wandb: true
+  wandb_mode: online
+  wandb_dir: /storage/dogac/TorchSpec/wandb
+  wandb_project: qwen3-8b-dflash-flow
+  wandb_group: qwen3-8b-flowspec-xm-20260919
+  wandb_random_suffix: false

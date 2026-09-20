@@ -1,0 +1,77 @@
+# Fresh Anchored EAGLE3 MLA baseline: five epochs on Qwen3-8B regenerated PerfectBlend.
+# 512 adjacent anchors, seven unroll steps, 6 training + 2 target GPUs.
+# Optimizer follows the existing Anchored EAGLE recipe: LR 1e-4, cosine, 1.5% warmup.
+# Launch: python -m torchspec.train_entry --config configs/vllm_qwen3_8b_anchored_10k_5ep.yaml
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+  draft_model_config: configs/draft_models/qwen3_8b_eagle3_mla.json
+dataset:
+  train_data_path: ../data/perfectblend_balanced_10k/qwen3_8b_regen/train.jsonl
+  eval_data_path: ../data/perfectblend_balanced_10k/qwen3_8b_regen/eval.jsonl
+  eval_interval: 250
+  eval_micro_batch_size: 1
+  chat_template: qwen3-thinking
+  prompt_key: conversations
+  min_loss_tokens: 16
+training:
+  attention_backend: flex_attention
+  eagle3_num_anchors: 512
+  micro_batch_size: 2
+  draft_accumulation_steps: 2
+  learning_rate: 0.0001
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 8192
+  num_epochs: 5
+  seed: 42
+  training_num_gpus_per_node: 6
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: true
+  warmup_ratio: 0.015
+  eagle3_anchor_max_gap: 0
+  lr_decay_style: cosine
+  min_lr: 0.0
+  eval_seed: 1234
+  eval_at_start: true
+  save_interval: 500
+  max_checkpoints: 3
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+inference:
+  inference_engine_type: vllm
+  store_last_hidden_states: true
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  vllm:
+    tp_size: 1
+    mem_fraction_static: 0.7
+    extra_args:
+      max_model_len: 16384
+      max_num_batched_tokens: 8192
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 32GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+output_dir: /storage/dogac/TorchSpec/outputs/qwen3-8b-anchored-eagle-10k-5ep
+cache_dir: /storage/dogac/TorchSpec/cache/qwen3-8b-anchored-eagle-10k-1ep
+model_download_dir: /storage/dogac/huggingface/hub
+logging:
+  report_to: wandb
+  use_tensorboard: false
+  use_wandb: true
+  wandb_mode: online
+  wandb_dir: /storage/dogac/TorchSpec/wandb
+  wandb_project: qwen3-8b-dflash-flow
+  wandb_group: qwen3-8b-anchored-eagle-10k-5ep
+  wandb_random_suffix: false

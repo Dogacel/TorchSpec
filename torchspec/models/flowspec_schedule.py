@@ -211,6 +211,19 @@ class LogitNormalMixtureTimeSchedule(nn.Module):
         )
 
 
+    def log_density(self, physical_time: torch.Tensor) -> torch.Tensor:
+        """Analytic mixture log-PDF, evaluated in float64 for importance weights."""
+        u = physical_time.double()
+        logit = torch.logit(u)
+        components = [
+            math.log(weight) - math.log(scale) - 0.5 * math.log(2.0 * math.pi)
+            - 0.5 * ((logit - mean) / scale).square()
+            - u.log() - torch.log1p(-u)
+            for weight, mean, scale in zip(self.weights, self.means, self.scales)
+        ]
+        return torch.logsumexp(torch.stack(components), dim=0)
+
+
 class UniformBlendedTimeSchedule(nn.Module):
     """Blend a data-calibrated time map with uniform physical time."""
 
@@ -223,6 +236,15 @@ class UniformBlendedTimeSchedule(nn.Module):
 
     def forward(self, tau: torch.Tensor) -> torch.Tensor:
         return self.base_weight * self.base_schedule(tau) + (1.0 - self.base_weight) * tau
+
+
+    def derivative(self, tau: torch.Tensor) -> torch.Tensor:
+        """dg/dtau for interior draws; boundary atoms are handled by the caller."""
+        if not isinstance(self.base_schedule, LogitNormalMixtureTimeSchedule):
+            raise TypeError("Analytic derivative requires a logit-normal mixture")
+        quantile = self.base_schedule(tau)
+        inverse_density = (-self.base_schedule.log_density(quantile)).exp()
+        return (self.base_weight * inverse_density + 1.0 - self.base_weight).float()
 
 
 def build_onehot_time_schedule(

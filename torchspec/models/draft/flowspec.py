@@ -41,7 +41,9 @@ the caller's block mask. The training/sampling wrapper owns the interpolant,
 anchor selection, loss, and probability-flow integration.
 """
 
+import json
 import math
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
@@ -77,6 +79,10 @@ class FlowSpecConfig(PretrainedConfig):
         output_bias: bool = True,
         tie_word_embeddings: bool = False,
         self_conditioning: bool = False,
+        pretrained_embeddings_and_head: bool = False,
+        freeze_embeddings_and_head: bool = True,
+        scratch_tokens: int = 0,
+        flow_block_size: int = 8,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -134,6 +140,14 @@ class FlowSpecConfig(PretrainedConfig):
         self.target_layer_ids = target_layer_ids
         self.output_bias = output_bias
         self.self_conditioning = self_conditioning
+        self.pretrained_embeddings_and_head = pretrained_embeddings_and_head
+        self.freeze_embeddings_and_head = freeze_embeddings_and_head
+        if not isinstance(scratch_tokens, int) or scratch_tokens < 0:
+            raise ValueError("scratch_tokens must be a non-negative integer")
+        if not isinstance(flow_block_size, int) or flow_block_size < 2:
+            raise ValueError("flow_block_size must be an integer at least 2")
+        self.scratch_tokens = scratch_tokens
+        self.flow_block_size = flow_block_size
 
 
 class FlowSpecRMSNorm(nn.Module):
@@ -459,7 +473,11 @@ class FlowSpecFinalLayer(nn.Module):
         self.ada_ln_modulation = nn.Linear(
             config.time_condition_size, 2 * config.hidden_size, bias=True
         )
-        self.linear = nn.Linear(config.hidden_size, config.vocab_size, bias=config.output_bias)
+        self.linear = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=config.output_bias and not config.pretrained_embeddings_and_head,
+        )
 
         nn.init.zeros_(self.ada_ln_modulation.weight)
         nn.init.zeros_(self.ada_ln_modulation.bias)
@@ -554,6 +572,75 @@ class FlowSpecDraftModel(PreTrainedModel):
             [FlowSpecDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
         self.output_layer = FlowSpecFinalLayer(config)
+        if config.pretrained_embeddings_and_head and config.freeze_embeddings_and_head:
+            self.vocab_embed.requires_grad_(False)
+            self.output_layer.linear.requires_grad_(False)
+        if config.scratch_tokens:
+            # Latent workspace: no token targets, vocabulary projection, or direct loss.
+            self.scratch_embedding = nn.Parameter(
+                torch.empty(config.scratch_tokens, config.hidden_size)
+            )
+            nn.init.normal_(self.scratch_embedding, std=0.02)
+
+    @torch.no_grad()
+    def load_pretrained_embeddings_and_head(
+        self,
+        model_path: str,
+        embedding_key: str = "model.embed_tokens.weight",
+        lm_head_key: str = "lm_head.weight",
+    ) -> None:
+        """Initialize vocabulary projections from a target checkpoint, before FSDP.
+
+        Only rank zero reads weights; the trainer broadcasts the complete state.
+        No target normalization or transformer weights are substituted.
+        """
+        if not self.config.pretrained_embeddings_and_head:
+            raise ValueError("Enable pretrained_embeddings_and_head before loading weights")
+        if self.vocab_embed.weight.is_meta or self.output_layer.linear.weight.is_meta:
+            raise ValueError("Pretrained weights must be loaded into materialized parameters")
+        directory = Path(model_path)
+        if not directory.is_dir():
+            from huggingface_hub import snapshot_download
+
+            directory = Path(snapshot_download(repo_id=model_path))
+        indexes = list(directory.glob("*.index.json"))
+        if len(indexes) > 1:
+            raise ValueError(f"Ambiguous checkpoint indexes in {directory}")
+        weight_map = json.loads(indexes[0].read_text())["weight_map"] if indexes else None
+        for key, parameter in (
+            (embedding_key, self.vocab_embed.weight),
+            (lm_head_key, self.output_layer.linear.weight),
+        ):
+            if weight_map is not None:
+                if key not in weight_map:
+                    raise KeyError(f"Target checkpoint does not contain {key!r}")
+                files = [directory / weight_map[key]]
+            else:
+                files = list(directory.glob("*.safetensors")) or list(directory.glob("*.bin"))
+            found = False
+            for file in files:
+                if file.suffix == ".safetensors":
+                    from safetensors import safe_open
+
+                    with safe_open(str(file), framework="pt", device="cpu") as reader:
+                        if key not in reader.keys():
+                            continue
+                        tensor = reader.get_tensor(key)
+                else:
+                    state = torch.load(file, map_location="cpu", weights_only=True)
+                    if key not in state:
+                        continue
+                    tensor = state[key]
+                if tensor.shape != parameter.shape:
+                    raise ValueError(
+                        f"Target {key} shape {tuple(tensor.shape)} does not match "
+                        f"FlowSpec {tuple(parameter.shape)}"
+                    )
+                parameter.copy_(tensor)
+                found = True
+                break
+            if not found:
+                raise KeyError(f"Target checkpoint does not contain {key!r}")
 
     def get_input_embeddings(self) -> nn.Module:
         return self.vocab_embed
@@ -659,6 +746,39 @@ class FlowSpecDraftModel(PreTrainedModel):
             draft_hidden.dtype
         )
 
+        scratch_tokens = self.config.scratch_tokens
+        if scratch_tokens:
+            block_size = self.config.flow_block_size
+            if draft_len % block_size:
+                raise ValueError("packed flow states must contain complete blocks")
+            num_blocks = draft_len // block_size
+            hidden = draft_hidden.reshape(batch_size, num_blocks, block_size, -1)
+            times = time_condition.reshape(batch_size, num_blocks, block_size, -1)
+            positions = draft_position_ids.reshape(batch_size, num_blocks, block_size)
+            scratch = self.scratch_embedding.to(draft_hidden.dtype)[None, None].expand(
+                batch_size, num_blocks, -1, -1
+            )
+            # Use the block's denoising stage; no labels enter the latent slots.
+            scratch_times = (
+                times[:, :, 1:].mean(dim=2, keepdim=True).expand(-1, -1, scratch_tokens, -1)
+            )
+            draft_hidden = torch.cat([hidden[:, :, :1], scratch, hidden[:, :, 1:]], dim=2).flatten(
+                1, 2
+            )
+            time_condition = torch.cat(
+                [times[:, :, :1], scratch_times, times[:, :, 1:]], dim=2
+            ).flatten(1, 2)
+            # Scratch slots share the anchor's RoPE coordinate and have distinct
+            # learned embeddings. Real token positions remain unchanged.
+            draft_position_ids = torch.cat(
+                [
+                    positions[:, :, :1],
+                    positions[:, :, :1].expand(-1, -1, scratch_tokens),
+                    positions[:, :, 1:],
+                ],
+                dim=2,
+            ).flatten(1, 2)
+
         for layer in self.layers:
             draft_hidden = layer(
                 draft_hidden=draft_hidden,
@@ -669,4 +789,15 @@ class FlowSpecDraftModel(PreTrainedModel):
                 block_mask=block_mask,
             )
 
+        if scratch_tokens:
+            hidden = draft_hidden.reshape(batch_size, num_blocks, block_size + scratch_tokens, -1)
+            times = time_condition.reshape(batch_size, num_blocks, block_size + scratch_tokens, -1)
+            # Discard latent positions before the vocabulary head: gradients to
+            # scratch slots can only come through attention into scored tokens.
+            draft_hidden = torch.cat(
+                [hidden[:, :, :1], hidden[:, :, 1 + scratch_tokens :]], dim=2
+            ).flatten(1, 2)
+            time_condition = torch.cat(
+                [times[:, :, :1], times[:, :, 1 + scratch_tokens :]], dim=2
+            ).flatten(1, 2)
         return self.output_layer(draft_hidden, time_condition)

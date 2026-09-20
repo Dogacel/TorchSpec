@@ -93,6 +93,7 @@ def _make_wrapper(
     time_schedule: str = "simplex_sharp",
     noise_type: str = "simplex",
     self_condition_probability: float = 0.0,
+    anchor_max_gap: int | None = None,
 ) -> FlowSpecModel:
     draft_model = FlowSpecDraftModel(
         _make_config(self_conditioning=self_condition_probability > 0.0)
@@ -101,6 +102,7 @@ def _make_wrapper(
         draft_model=draft_model,
         block_size=block_size,
         num_anchors=num_anchors,
+        anchor_max_gap=anchor_max_gap,
         boundary_probability=boundary_probability,
         clean_deadline_jitter=clean_deadline_jitter,
         block_schedule_overlap=block_schedule_overlap,
@@ -167,6 +169,7 @@ class TestFlowSpecConfig(unittest.TestCase):
     def test_ode_eval_defaults_are_disabled(self):
         training = Config().training
         self.assertEqual(training.flowspec_loss_decay_gamma, 7.0)
+        self.assertIsNone(training.flowspec_anchor_max_gap)
         self.assertEqual(training.flowspec_boundary_probability, 0.0)
         self.assertEqual(training.flowspec_clean_deadline_jitter, 0.0)
         self.assertEqual(training.flowspec_block_schedule_overlap, 1.0)
@@ -309,6 +312,17 @@ class TestFlowSpecBlockMask(unittest.TestCase):
         expected_second_block[11:14] = True
         torch.testing.assert_close(mask[3], expected_second_block)
         torch.testing.assert_close(mask[5], expected_second_block)
+
+    def test_overlapping_blocks_cannot_see_each_other(self):
+        mask = _create_flowspec_dense_mask(
+            torch.tensor([[2, 3]]), self.keep, self.context_len, self.block_size
+        )[0, 0]
+        self.assertFalse(mask[:3, 11:14].any())
+        self.assertFalse(mask[3:6, 8:11].any())
+        self.assertFalse(mask[:3, 2:8].any())
+        self.assertFalse(mask[3:6, 3:8].any())
+        self.assertTrue(mask[:3, 8:11].all())
+        self.assertTrue(mask[3:6, 11:14].all())
 
     def test_invalid_block_sees_nothing(self):
         keep = torch.tensor([[True, False]])
@@ -775,6 +789,39 @@ class TestFlowSpecWrapper(unittest.TestCase):
 
         torch.testing.assert_close(first[0], second[0])
         torch.testing.assert_close(first[1], second[1])
+
+    def test_adjacent_512_anchors_cover_tokens_at_multiple_depths(self):
+        model = _make_wrapper(block_size=8, num_anchors=512, anchor_max_gap=0)
+        mask = torch.ones(1, 8192)
+        first = model._sample_anchor_positions(mask, generator=torch.Generator().manual_seed(42))
+        second = model._sample_anchor_positions(mask, generator=torch.Generator().manual_seed(42))
+        anchors, keep = first
+        torch.testing.assert_close(anchors, second[0])
+        torch.testing.assert_close(keep, second[1])
+        self.assertEqual(anchors.shape, (1, 512))
+        self.assertTrue(keep.all())
+        self.assertEqual(anchors.unique().numel(), 512)
+        targets = anchors.unsqueeze(-1) + torch.arange(1, 8)
+        coverage = torch.bincount(targets.flatten(), minlength=8192)
+        self.assertEqual(coverage.max().item(), 7)
+        self.assertGreater(int((coverage == 7).sum()), 480)
+
+    def test_adjacent_anchors_preserve_full_block_supervision_and_padding(self):
+        model = _make_wrapper(block_size=8, num_anchors=512, anchor_max_gap=0)
+        mask = torch.zeros(3, 80)
+        mask[0, 2:22] = 1
+        mask[0, 40:60] = 1
+        mask[2, 5:11] = 1  # Too short for a complete block.
+        anchors, keep = model._sample_anchor_positions(mask)
+        self.assertEqual(keep.sum(dim=1).tolist(), [26, 0, 0])
+        self.assertTrue((anchors[~keep] == 0).all())
+        positions = anchors[0, keep[0]].unsqueeze(1) + torch.arange(8)
+        self.assertTrue((mask[0, positions] == 1).all())
+        self.assertEqual(anchors[0, keep[0]].unique().numel(), 26)
+
+    def test_negative_anchor_gap_rejected(self):
+        with self.assertRaisesRegex(ValueError, "anchor_max_gap"):
+            _make_wrapper(anchor_max_gap=-1)
 
     def test_positions_start_at_anchor(self):
         model = _make_wrapper(block_size=3, num_anchors=2)

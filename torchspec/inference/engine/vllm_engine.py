@@ -341,7 +341,9 @@ class VllmEngine(InferenceEngine, RayActor):
 
         max_seq_length = getattr(self.args, "max_seq_length", None)
         if max_seq_length:
-            engine_kwargs["max_model_len"] = max_seq_length
+            # Hidden-state extraction requests one output token after the prompt.
+            # Preserve an explicit context override independently of training length.
+            engine_kwargs.setdefault("max_model_len", max_seq_length + 1)
 
         if dist_init_addr:
             host, port_str = dist_init_addr.rsplit(":", 1)

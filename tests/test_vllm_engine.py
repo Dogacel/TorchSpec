@@ -155,6 +155,32 @@ def _build_engine_with_mock_vllm():
     return engine, mock_llm
 
 
+@pytest.mark.parametrize("context_override", [None, 16384])
+def test_engine_context_reserves_output_token_and_honors_override(monkeypatch, context_override):
+    from torchspec.inference.engine.vllm_engine import VllmEngine
+
+    engine = VllmEngine.__new__(VllmEngine)
+    engine.args = types.SimpleNamespace(
+        target_model_path="mock-model",
+        max_seq_length=8192,
+        vllm_extra_args=(
+            {"max_model_len": context_override} if context_override is not None else {}
+        ),
+    )
+    engine.base_gpu_id = None
+    engine.rank = 0
+    engine.aux_hidden_state_layer_ids = [2, 4]
+    mock_llm = MagicMock()
+    monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(LLM=mock_llm))
+
+    engine._init_engine(tp_size=1, pp_size=1, nnodes=1, mem_fraction=0.7, dist_init_addr=None)
+
+    context = mock_llm.call_args.kwargs["max_model_len"]
+    assert context == (context_override if context_override is not None else 8193)
+    assert engine.args.max_seq_length == 8192
+    assert engine.args.max_seq_length + 1 <= context
+
+
 class TestGenerateWithExtractHiddenStates:
     """Test that generate() reads kv_transfer_params from outputs."""
 

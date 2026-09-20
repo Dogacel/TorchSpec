@@ -63,6 +63,7 @@ class DFlashTrainer(Trainer):
             draft_model=draft_model,
             block_size=self.block_size,
             num_anchors=self.num_anchors,
+            anchor_max_gap=self.anchor_max_gap,
             loss_objective=self.loss_objective,
             dpace_alpha=self.dpace_alpha,
             loss_decay_gamma=self.loss_decay_gamma,
@@ -76,6 +77,7 @@ class DFlashTrainer(Trainer):
         self.num_target_layers = getattr(args, "dflash_num_target_layers", 5)
         self.block_size = getattr(args, "dflash_block_size", 16)
         self.num_anchors = getattr(args, "dflash_num_anchors", 512)
+        self.anchor_max_gap = getattr(args, "dflash_anchor_max_gap", None)
         self.loss_objective = getattr(args, "dflash_loss_objective", "decay")
         self.dpace_alpha = getattr(args, "dflash_dpace_alpha", 0.5)
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
