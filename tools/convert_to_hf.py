@@ -304,7 +304,7 @@ def _save_with_vocab_pruning(
     t2d: torch.Tensor,
     export_for_vllm: bool = False,
 ) -> None:
-    tensors = _prepare_export_tensors(hf_model, export_for_vllm)
+    tensors = _prepare_export_tensors(hf_model)
     tensors["t2d"] = t2d
     tensors["d2t"] = d2t
 
@@ -325,7 +325,9 @@ def _save_with_vocab_pruning(
                 current_size,
                 draft_vocab_size,
             )
-            tensors[lm_head_key] = tensors[lm_head_key][d2t]
+            # Serving stores draft-to-target offsets, not absolute target IDs.
+            target_ids = d2t + torch.arange(len(d2t), device=d2t.device)
+            tensors[lm_head_key] = tensors[lm_head_key][target_ids]
         elif current_size == draft_vocab_size:
             raise ValueError(
                 f"lm_head is already pruned to draft_vocab_size ({current_size}). "

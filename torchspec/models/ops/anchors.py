@@ -61,6 +61,7 @@ def sample_anchor_positions(
     block_size: int,
     device: torch.device,
     max_gap: Optional[int] = None,
+    non_overlapping: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sample anchor positions per sample; returns (anchors, keep_mask).
 
@@ -80,6 +81,11 @@ def sample_anchor_positions(
                       at all ``block_size`` depths, as in the dense unroll
         max_gap=k     every (k+1)-th supervised position, over a (k+1)x wider span
         max_gap=None  defaults to ``block_size``: one depth per token
+
+    ``non_overlapping=True`` overrides ``max_gap`` and samples every block_size-th
+    valid candidate with a random phase. Thus raw anchor distances are at least
+    block_size, including across disjoint supervised spans. If this yields more
+    than num_anchors, take a random subset; otherwise mask the unused slots.
 
     Gaps count supervised positions, not raw tokens, so slots are never spent on
     unsupervised regions and anchors stay token-adjacent inside a supervised span.
@@ -106,6 +112,23 @@ def sample_anchor_positions(
     )
     # Supervised positions in order; sentinels sort to the back and are masked off below.
     ordered = masked_indices.sort(dim=1).values
+
+    if non_overlapping:
+        ranks = torch.arange(num_candidates, device=device).unsqueeze(0)
+        phase_range = valid_counts.clamp(min=1, max=block_size).unsqueeze(1)
+        phase = (torch.rand(bsz, 1, device=device) * phase_range).long()
+        eligible = (ranks < valid_counts.unsqueeze(1)) & (ranks % block_size == phase)
+        scores = torch.rand(bsz, num_candidates, device=device).masked_fill(~eligible, -1)
+        k = min(num_anchors, num_candidates)
+        chosen = scores.topk(k, dim=1).indices
+        keep = eligible.gather(1, chosen)
+        anchors = ordered.gather(1, chosen)
+        anchors = torch.where(keep, anchors, 0)
+        # Keep query shapes fixed, even when only a few disjoint blocks fit.
+        if k < num_anchors:
+            anchors = torch.nn.functional.pad(anchors, (0, num_anchors - k))
+            keep = torch.nn.functional.pad(keep, (0, num_anchors - k), value=False)
+        return anchors, keep
 
     # Spread the budget over the whole sample when it reaches, otherwise pack as tightly
     # as max_gap allows. The window wraps and its phase is drawn over every candidate, so

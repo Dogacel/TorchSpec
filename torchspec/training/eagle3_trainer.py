@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from torchspec import AutoDraftModelConfig, AutoEagle3DraftModel, Eagle3Model
 from torchspec.models.anchored_eagle3 import AnchoredEagle3Model
@@ -498,6 +499,10 @@ class Eagle3Trainer(Trainer):
         weighted_counts = torch.cat((acc_correct_sum, acc_counts_sum, alpha_weighted_sum))
         dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
         dist.all_reduce(weighted_counts, op=dist.ReduceOp.SUM)
+
+        # Metric packing needs ordinary tensors; FSDP may return a DTensor norm.
+        if isinstance(grad_norm, DTensor):
+            grad_norm = grad_norm.full_tensor()
 
         grad_norm_value = (
             grad_norm.to(device=avg_vlosses.device, dtype=avg_vlosses.dtype)

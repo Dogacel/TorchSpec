@@ -136,6 +136,49 @@ class TestEagle3TrainerAggregation(unittest.TestCase):
         self.assertNotAlmostEqual(metrics["train/acc_0"], naive_mean, places=3)
 
 
+def _dtensor_grad_norm_metrics_worker(rank, init_file):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Partial, Shard
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=2)
+    try:
+        mesh = DeviceMesh("cpu", [0, 1])
+        param = torch.nn.Parameter(
+            DTensor.from_local(torch.zeros(1), mesh, [Shard(0)], run_check=False)
+        )
+        param.grad = DTensor.from_local(
+            torch.tensor([3.0 if rank == 0 else 4.0]), mesh, [Shard(0)], run_check=False
+        )
+        clipped_norm = torch.nn.utils.clip_grad_norm_([param], max_norm=1.0)
+        assert isinstance(clipped_norm, DTensor)
+        partial_norm = DTensor.from_local(torch.tensor(3.0), mesh, [Partial()], run_check=False)
+        # Existing tests cover metric reductions. Keep those local here so Gloo's
+        # AVG support is irrelevant; DTensor still performs real collectives.
+        with mock.patch.object(eagle3_trainer_module.dist, "all_reduce", return_value=None):
+            trainer = TestEagle3TrainerAggregation._make_trainer()
+            for norm, expected in [(clipped_norm, 5.0), (partial_norm, 6.0)]:
+                metrics = trainer._aggregate_metrics(_step_metrics(), step=11, grad_norm=norm)
+                assert abs(metrics["train/grad_norm"] - expected) < 1e-6
+                assert abs(metrics["train/avg_loss"] - 7.0 / 3.0) < 1e-6
+    finally:
+        dist.destroy_process_group()
+
+
+class TestEagle3TrainerDTensorMetrics(unittest.TestCase):
+    def test_distributed_gradient_norms_can_be_packed_with_local_metrics(self):
+        import torch.multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(
+                _dtensor_grad_norm_metrics_worker,
+                args=(str(Path(directory) / "init"),),
+                nprocs=2,
+                join=True,
+            )
+
+
 class TestEagle3TrainerEvalAggregation(unittest.TestCase):
     @staticmethod
     def _make_trainer():

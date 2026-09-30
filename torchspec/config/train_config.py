@@ -161,6 +161,11 @@ class TrainingConfig:
     dflash_ce_loss_alpha: float = 1.0
     dflash_l1_loss_alpha: float = 0.0
     dflash_num_anchors: int = 512
+    # Supervised positions between anchors: 0 gives adjacent, overlapping blocks.
+    # None preserves the shared sampler default.
+    dflash_anchor_max_gap: Optional[int] = None
+    # Enforce disjoint blocks; num_anchors becomes a cap, with unused slots masked.
+    dflash_non_overlapping_anchors: bool = False
     dflash_num_target_layers: int = 5
 
     # DFlash2-specific parameters (used by DFlash2 trainer only)

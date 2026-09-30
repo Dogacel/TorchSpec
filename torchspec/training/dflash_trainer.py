@@ -62,6 +62,8 @@ class DFlashTrainer(Trainer):
             draft_model=draft_model,
             block_size=self.block_size,
             num_anchors=self.num_anchors,
+            anchor_max_gap=self.anchor_max_gap,
+            non_overlapping_anchors=self.non_overlapping_anchors,
             loss_objective=self.loss_objective,
             dpace_alpha=self.dpace_alpha,
             loss_decay_gamma=self.loss_decay_gamma,
@@ -75,6 +77,8 @@ class DFlashTrainer(Trainer):
         self.num_target_layers = getattr(args, "dflash_num_target_layers", 5)
         self.block_size = getattr(args, "dflash_block_size", 16)
         self.num_anchors = getattr(args, "dflash_num_anchors", 512)
+        self.anchor_max_gap = getattr(args, "dflash_anchor_max_gap", None)
+        self.non_overlapping_anchors = getattr(args, "dflash_non_overlapping_anchors", False)
         self.loss_objective = getattr(args, "dflash_loss_objective", "decay")
         self.dpace_alpha = getattr(args, "dflash_dpace_alpha", 0.5)
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
@@ -134,6 +138,9 @@ class DFlashTrainer(Trainer):
             draft_model = self._build_draft_model(config)
 
         if dist.get_rank() == 0:
+            initial_path = getattr(self.args, "initial_draft_model_path", None)
+            if initial_path:
+                checkpoint.load_initial_dflash_weights(draft_model, initial_path)
             draft_model.load_embedding(
                 target_model_path,
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens.weight"),

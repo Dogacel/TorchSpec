@@ -9,7 +9,9 @@ from torchspec.training import checkpoint
 
 class DummyBF16Optimizer:
     def __init__(self, *, lr: float, betas: tuple[float, float], weight_decay: float) -> None:
-        self.fp32_params = [torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))]
+        self.model = torch.nn.Module()
+        self.model.register_parameter("weight", torch.nn.Parameter(torch.tensor([1.0])))
+        self.fp32_params = [torch.nn.Parameter(self.model.weight.detach().clone().float())]
         self.optimizer = torch.optim.AdamW(
             self.fp32_params,
             lr=lr,
@@ -37,7 +39,7 @@ def test_restore_fp32_master_params_keeps_fresh_optimizer_hparams():
 
     checkpoint_state = {
         "optim": checkpoint_optimizer.optimizer.state_dict(),
-        "fp32_params": {"0": checkpoint_optimizer.fp32_params[0].detach().clone()},
+        "fp32_params": {"weight": checkpoint_optimizer.fp32_params[0].detach().clone()},
     }
 
     def fake_dcp_load(*, state_dict, checkpoint_id):
